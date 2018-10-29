@@ -38,7 +38,7 @@ cell = ["actix-net/cell"]
 actix = "0.7.5"
 #actix-net = "0.1.1"
 #actix-net = { path="../actix-net/" }
-actix-net = { git="https://github.com/actix/actix-net.git" }
+actix-net = { git="https://github.com/actix/actix-net.git", branch="stable-0.2" }
 
 base64 = "0.9"
 bitflags = "1.0"
