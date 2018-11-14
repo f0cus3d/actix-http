@@ -2,29 +2,35 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::rc::Rc;
 
+use bytes::Bytes;
+use futures::{Async, Poll, Stream};
 use http::{HeaderMap, Method, StatusCode, Version};
 
+use body::PayloadStream;
+use error::PayloadError;
 use extensions::Extensions;
 use httpmessage::HttpMessage;
-use payload::Payload;
 use request::{Message, MessageFlags, MessagePool};
 use uri::Url;
+
+use super::pipeline::Payload;
 
 /// Client Response
 pub struct ClientResponse {
     pub(crate) inner: Rc<Message>,
+    pub(crate) payload: RefCell<Option<PayloadStream>>,
 }
 
 impl HttpMessage for ClientResponse {
-    type Stream = Payload;
+    type Stream = PayloadStream;
 
     fn headers(&self) -> &HeaderMap {
         &self.inner.headers
     }
 
     #[inline]
-    fn payload(&self) -> Payload {
-        if let Some(payload) = self.inner.payload.borrow_mut().take() {
+    fn payload(&self) -> Self::Stream {
+        if let Some(payload) = self.payload.borrow_mut().take() {
             payload
         } else {
             Payload::empty()
@@ -52,6 +58,7 @@ impl ClientResponse {
                 payload: RefCell::new(None),
                 extensions: RefCell::new(Extensions::new()),
             }),
+            payload: RefCell::new(None),
         }
     }
 
@@ -105,6 +112,19 @@ impl ClientResponse {
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<Extensions> {
         self.inner().extensions.borrow_mut()
+    }
+}
+
+impl Stream for ClientResponse {
+    type Item = Bytes;
+    type Error = PayloadError;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        if let Some(ref mut payload) = &mut *self.payload.borrow_mut() {
+            payload.poll()
+        } else {
+            Ok(Async::Ready(None))
+        }
     }
 }
 

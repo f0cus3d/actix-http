@@ -9,7 +9,7 @@ mod dispatcher;
 mod encoder;
 mod service;
 
-pub use self::client::ClientCodec;
+pub use self::client::{ClientCodec, ClientPayloadCodec};
 pub use self::codec::Codec;
 pub use self::decoder::{PayloadDecoder, RequestDecoder};
 pub use self::dispatcher::Dispatcher;
@@ -44,7 +44,7 @@ impl<T> From<T> for Message<T> {
 pub enum MessageType {
     None,
     Payload,
-    Unhandled,
+    Stream,
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ use rand;
 use sha1::Sha1;
 use tokio_io::{AsyncRead, AsyncWrite};
 
+use body::BodyType;
 use client::ClientResponse;
 use h1;
 use ws::Codec;
@@ -89,9 +90,7 @@ where
                 req.request.set_header(header::ORIGIN, origin);
             }
 
-            req.request.upgrade();
-            req.request.set_header(header::UPGRADE, "websocket");
-            req.request.set_header(header::CONNECTION, "upgrade");
+            req.request.upgrade("websocket");
             req.request.set_header(header::SEC_WEBSOCKET_VERSION, "13");
 
             if let Some(protocols) = req.protocols.take() {
@@ -142,7 +141,7 @@ where
                         // h1 protocol
                         let framed = Framed::new(io, h1::ClientCodec::default());
                         framed
-                            .send(request.into())
+                            .send((request.into_parts().0, BodyType::None).into())
                             .map_err(ClientError::from)
                             .and_then(|framed| {
                                 framed
@@ -173,10 +172,7 @@ where
 {
     fut: Box<
         Future<
-            Item = (
-                Option<h1::Message<ClientResponse>>,
-                Framed<T, h1::ClientCodec>,
-            ),
+            Item = (Option<ClientResponse>, Framed<T, h1::ClientCodec>),
             Error = ClientError,
         >,
     >,
@@ -197,8 +193,7 @@ where
         let (item, framed) = try_ready!(self.fut.poll());
 
         let res = match item {
-            Some(h1::Message::Item(res)) => res,
-            Some(h1::Message::Chunk(_)) => unreachable!(),
+            Some(res) => res,
             None => return Err(ClientError::Disconnected),
         };
 
