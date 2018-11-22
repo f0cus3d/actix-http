@@ -8,41 +8,51 @@ use futures::{Async, Future, Poll, Sink, Stream};
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use super::error::{ConnectorError, SendRequestError};
-use super::request::RequestHead;
 use super::response::ClientResponse;
 use super::{Connect, Connection};
-use body::{BodyType, MessageBody, PayloadStream};
+use body::{BodyLength, MessageBody, PayloadStream};
 use error::PayloadError;
 use h1;
+use message::RequestHead;
 
-pub fn send_request<T, Io, B>(
+pub(crate) fn send_request<T, I, B>(
     head: RequestHead,
     body: B,
     connector: &mut T,
 ) -> impl Future<Item = ClientResponse, Error = SendRequestError>
 where
-    T: Service<Request = Connect, Response = Connection<Io>, Error = ConnectorError>,
+    T: Service<Request = Connect, Response = I, Error = ConnectorError>,
     B: MessageBody,
-    Io: AsyncRead + AsyncWrite + 'static,
+    I: Connection,
 {
-    let tp = body.tp();
+    let len = body.length();
 
     connector
+        // connect to the host
         .call(Connect::new(head.uri.clone()))
         .from_err()
+        // create Framed and send reqest
         .map(|io| Framed::new(io, h1::ClientCodec::default()))
-        .and_then(|framed| framed.send((head, tp).into()).from_err())
-        .and_then(move |framed| match body.tp() {
-            BodyType::None | BodyType::Zero => Either::A(ok(framed)),
+        .and_then(move |framed| framed.send((head, len).into()).from_err())
+        // send request body
+        .and_then(move |framed| match body.length() {
+            BodyLength::None | BodyLength::Empty | BodyLength::Sized(0) => {
+                Either::A(ok(framed))
+            }
             _ => Either::B(SendBody::new(body, framed)),
-        }).and_then(|framed| {
+        })
+        // read response and init read body
+        .and_then(|framed| {
             framed
                 .into_future()
                 .map_err(|(e, _)| SendRequestError::from(e))
                 .and_then(|(item, framed)| {
                     if let Some(res) = item {
                         match framed.get_codec().message_type() {
-                            h1::MessageType::None => release_connection(framed),
+                            h1::MessageType::None => {
+                                let force_close = !framed.get_codec().keepalive();
+                                release_connection(framed, force_close)
+                            }
                             _ => {
                                 *res.payload.borrow_mut() = Some(Payload::stream(framed))
                             }
@@ -55,19 +65,20 @@ where
         })
 }
 
-struct SendBody<Io, B> {
+/// Future responsible for sending request body to the peer
+struct SendBody<I, B> {
     body: Option<B>,
-    framed: Option<Framed<Connection<Io>, h1::ClientCodec>>,
-    write_buf: VecDeque<h1::Message<(RequestHead, BodyType)>>,
+    framed: Option<Framed<I, h1::ClientCodec>>,
+    write_buf: VecDeque<h1::Message<(RequestHead, BodyLength)>>,
     flushed: bool,
 }
 
-impl<Io, B> SendBody<Io, B>
+impl<I, B> SendBody<I, B>
 where
-    Io: AsyncRead + AsyncWrite + 'static,
+    I: AsyncRead + AsyncWrite + 'static,
     B: MessageBody,
 {
-    fn new(body: B, framed: Framed<Connection<Io>, h1::ClientCodec>) -> Self {
+    fn new(body: B, framed: Framed<I, h1::ClientCodec>) -> Self {
         SendBody {
             body: Some(body),
             framed: Some(framed),
@@ -77,12 +88,12 @@ where
     }
 }
 
-impl<Io, B> Future for SendBody<Io, B>
+impl<I, B> Future for SendBody<I, B>
 where
-    Io: AsyncRead + AsyncWrite + 'static,
+    I: Connection,
     B: MessageBody,
 {
-    type Item = Framed<Connection<Io>, h1::ClientCodec>;
+    type Item = Framed<I, h1::ClientCodec>;
     type Error = SendRequestError;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -94,6 +105,10 @@ where
             {
                 match self.body.as_mut().unwrap().poll_next()? {
                     Async::Ready(item) => {
+                        // check if body is done
+                        if item.is_none() {
+                            let _ = self.body.take();
+                        }
                         self.flushed = false;
                         self.framed
                             .as_mut()
@@ -135,7 +150,7 @@ impl Stream for EmptyPayload {
 }
 
 pub(crate) struct Payload<Io> {
-    framed: Option<Framed<Connection<Io>, h1::ClientPayloadCodec>>,
+    framed: Option<Framed<Io, h1::ClientPayloadCodec>>,
 }
 
 impl Payload<()> {
@@ -144,15 +159,15 @@ impl Payload<()> {
     }
 }
 
-impl<Io: AsyncRead + AsyncWrite + 'static> Payload<Io> {
-    fn stream(framed: Framed<Connection<Io>, h1::ClientCodec>) -> PayloadStream {
+impl<Io: Connection> Payload<Io> {
+    fn stream(framed: Framed<Io, h1::ClientCodec>) -> PayloadStream {
         Box::new(Payload {
             framed: Some(framed.map_codec(|codec| codec.into_payload_codec())),
         })
     }
 }
 
-impl<Io: AsyncRead + AsyncWrite + 'static> Stream for Payload<Io> {
+impl<Io: Connection> Stream for Payload<Io> {
     type Item = Bytes;
     type Error = PayloadError;
 
@@ -162,7 +177,9 @@ impl<Io: AsyncRead + AsyncWrite + 'static> Stream for Payload<Io> {
             Async::Ready(Some(chunk)) => if let Some(chunk) = chunk {
                 Ok(Async::Ready(Some(chunk)))
             } else {
-                release_connection(self.framed.take().unwrap());
+                let framed = self.framed.take().unwrap();
+                let force_close = framed.get_codec().keepalive();
+                release_connection(framed, force_close);
                 Ok(Async::Ready(None))
             },
             Async::Ready(None) => Ok(Async::Ready(None)),
@@ -170,12 +187,12 @@ impl<Io: AsyncRead + AsyncWrite + 'static> Stream for Payload<Io> {
     }
 }
 
-fn release_connection<T, U>(framed: Framed<Connection<T>, U>)
+fn release_connection<T, U>(framed: Framed<T, U>, force_close: bool)
 where
-    T: AsyncRead + AsyncWrite + 'static,
+    T: Connection,
 {
-    let parts = framed.into_parts();
-    if parts.read_buf.is_empty() && parts.write_buf.is_empty() {
+    let mut parts = framed.into_parts();
+    if !force_close && parts.read_buf.is_empty() && parts.write_buf.is_empty() {
         parts.io.release()
     } else {
         parts.io.close()

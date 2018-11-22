@@ -4,11 +4,11 @@ use std::io::{self, Write};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_codec::{Decoder, Encoder};
 
-use super::decoder::{PayloadDecoder, PayloadItem, PayloadType, ResponseDecoder};
-use super::encoder::{RequestEncoder, ResponseLength};
+use super::decoder::{PayloadDecoder, PayloadItem, PayloadType};
+use super::{decoder, encoder};
 use super::{Message, MessageType};
-use body::{Binary, Body, BodyType};
-use client::{ClientResponse, RequestHead};
+use body::BodyLength;
+use client::ClientResponse;
 use config::ServiceConfig;
 use error::{ParseError, PayloadError};
 use helpers;
@@ -16,13 +16,11 @@ use http::header::{
     HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
-use request::MessagePool;
+use message::{ConnectionType, Head, MessagePool, RequestHead};
 
 bitflags! {
     struct Flags: u8 {
         const HEAD              = 0b0000_0001;
-        const UPGRADE           = 0b0000_0010;
-        const KEEPALIVE         = 0b0000_0100;
         const KEEPALIVE_ENABLED = 0b0000_1000;
         const STREAM            = 0b0001_0000;
     }
@@ -42,14 +40,15 @@ pub struct ClientPayloadCodec {
 
 struct ClientCodecInner {
     config: ServiceConfig,
-    decoder: ResponseDecoder,
+    decoder: decoder::MessageDecoder<ClientResponse>,
     payload: Option<PayloadDecoder>,
     version: Version,
+    ctype: ConnectionType,
 
     // encoder part
     flags: Flags,
     headers_size: u32,
-    te: RequestEncoder,
+    encoder: encoder::MessageEncoder<RequestHead>,
 }
 
 impl Default for ClientCodec {
@@ -63,11 +62,6 @@ impl ClientCodec {
     ///
     /// `keepalive_enabled` how response `connection` header get generated.
     pub fn new(config: ServiceConfig) -> Self {
-        ClientCodec::with_pool(MessagePool::pool(), config)
-    }
-
-    /// Create HTTP/1 codec with request's pool
-    pub(crate) fn with_pool(pool: &'static MessagePool, config: ServiceConfig) -> Self {
         let flags = if config.keep_alive_enabled() {
             Flags::KEEPALIVE_ENABLED
         } else {
@@ -76,25 +70,26 @@ impl ClientCodec {
         ClientCodec {
             inner: ClientCodecInner {
                 config,
-                decoder: ResponseDecoder::with_pool(pool),
+                decoder: decoder::MessageDecoder::default(),
                 payload: None,
                 version: Version::HTTP_11,
+                ctype: ConnectionType::Close,
 
                 flags,
                 headers_size: 0,
-                te: RequestEncoder::default(),
+                encoder: encoder::MessageEncoder::default(),
             },
         }
     }
 
     /// Check if request is upgrade
     pub fn upgrade(&self) -> bool {
-        self.inner.flags.contains(Flags::UPGRADE)
+        self.inner.ctype == ConnectionType::Upgrade
     }
 
     /// Check if last response is keep-alive
     pub fn keepalive(&self) -> bool {
-        self.inner.flags.contains(Flags::KEEPALIVE)
+        self.inner.ctype == ConnectionType::KeepAlive
     }
 
     /// Check last request's message type
@@ -108,15 +103,6 @@ impl ClientCodec {
         }
     }
 
-    /// prepare transfer encoding
-    pub fn prepare_te(&mut self, head: &mut RequestHead, btype: BodyType) {
-        self.inner.te.update(
-            head,
-            self.inner.flags.contains(Flags::HEAD),
-            self.inner.version,
-        );
-    }
-
     /// Convert message codec to a payload codec
     pub fn into_payload_codec(self) -> ClientPayloadCodec {
         ClientPayloadCodec { inner: self.inner }
@@ -124,56 +110,14 @@ impl ClientCodec {
 }
 
 impl ClientPayloadCodec {
+    /// Check if last response is keep-alive
+    pub fn keepalive(&self) -> bool {
+        self.inner.ctype == ConnectionType::KeepAlive
+    }
+
     /// Transform payload codec to a message codec
     pub fn into_message_codec(self) -> ClientCodec {
         ClientCodec { inner: self.inner }
-    }
-}
-
-impl ClientCodecInner {
-    fn encode_response(
-        &mut self,
-        msg: RequestHead,
-        btype: BodyType,
-        buffer: &mut BytesMut,
-    ) -> io::Result<()> {
-        // render message
-        {
-            // status line
-            writeln!(
-                Writer(buffer),
-                "{} {} {:?}\r",
-                msg.method,
-                msg.uri.path_and_query().map(|u| u.as_str()).unwrap_or("/"),
-                msg.version
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            // write headers
-            buffer.reserve(msg.headers.len() * AVERAGE_HEADER_SIZE);
-            for (key, value) in &msg.headers {
-                let v = value.as_ref();
-                let k = key.as_str().as_bytes();
-                buffer.reserve(k.len() + v.len() + 4);
-                buffer.put_slice(k);
-                buffer.put_slice(b": ");
-                buffer.put_slice(v);
-                buffer.put_slice(b"\r\n");
-
-                // Connection upgrade
-                if key == UPGRADE {
-                    self.flags.insert(Flags::UPGRADE);
-                }
-            }
-
-            // set date header
-            if !msg.headers.contains_key(DATE) {
-                self.config.set_date(buffer);
-            } else {
-                buffer.extend_from_slice(b"\r\n");
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -185,21 +129,27 @@ impl Decoder for ClientCodec {
         debug_assert!(!self.inner.payload.is_some(), "Payload decoder is set");
 
         if let Some((req, payload)) = self.inner.decoder.decode(src)? {
-            self.inner
-                .flags
-                .set(Flags::HEAD, req.inner.method == Method::HEAD);
-            self.inner.version = req.inner.version;
-            if self.inner.flags.contains(Flags::KEEPALIVE_ENABLED) {
-                self.inner.flags.set(Flags::KEEPALIVE, req.keep_alive());
+            if let Some(ctype) = req.head().ctype {
+                // do not use peer's keep-alive
+                self.inner.ctype = if ctype == ConnectionType::KeepAlive {
+                    self.inner.ctype
+                } else {
+                    ctype
+                };
             }
-            match payload {
-                PayloadType::None => self.inner.payload = None,
-                PayloadType::Payload(pl) => self.inner.payload = Some(pl),
-                PayloadType::Stream(pl) => {
-                    self.inner.payload = Some(pl);
-                    self.inner.flags.insert(Flags::STREAM);
+
+            if !self.inner.flags.contains(Flags::HEAD) {
+                match payload {
+                    PayloadType::None => self.inner.payload = None,
+                    PayloadType::Payload(pl) => self.inner.payload = Some(pl),
+                    PayloadType::Stream(pl) => {
+                        self.inner.payload = Some(pl);
+                        self.inner.flags.insert(Flags::STREAM);
+                    }
                 }
-            };
+            } else {
+                self.inner.payload = None;
+            }
             Ok(Some(req))
         } else {
             Ok(None)
@@ -229,7 +179,7 @@ impl Decoder for ClientPayloadCodec {
 }
 
 impl Encoder for ClientCodec {
-    type Item = Message<(RequestHead, BodyType)>;
+    type Item = Message<(RequestHead, BodyLength)>;
     type Error = io::Error;
 
     fn encode(
@@ -238,14 +188,39 @@ impl Encoder for ClientCodec {
         dst: &mut BytesMut,
     ) -> Result<(), Self::Error> {
         match item {
-            Message::Item((msg, btype)) => {
-                self.inner.encode_response(msg, btype, dst)?;
+            Message::Item((mut msg, length)) => {
+                let inner = &mut self.inner;
+                inner.version = msg.version;
+                inner.flags.set(Flags::HEAD, msg.method == Method::HEAD);
+
+                // connection status
+                inner.ctype = match msg.connection_type() {
+                    ConnectionType::KeepAlive => {
+                        if inner.flags.contains(Flags::KEEPALIVE_ENABLED) {
+                            ConnectionType::KeepAlive
+                        } else {
+                            ConnectionType::Close
+                        }
+                    }
+                    ConnectionType::Upgrade => ConnectionType::Upgrade,
+                    ConnectionType::Close => ConnectionType::Close,
+                };
+
+                inner.encoder.encode(
+                    dst,
+                    &mut msg,
+                    false,
+                    inner.version,
+                    length,
+                    inner.ctype,
+                    &inner.config,
+                )?;
             }
             Message::Chunk(Some(bytes)) => {
-                self.inner.te.encode(bytes.as_ref(), dst)?;
+                self.inner.encoder.encode_chunk(bytes.as_ref(), dst)?;
             }
             Message::Chunk(None) => {
-                self.inner.te.encode_eof(dst)?;
+                self.inner.encoder.encode_eof(dst)?;
             }
         }
         Ok(())

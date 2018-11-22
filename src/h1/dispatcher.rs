@@ -1,18 +1,19 @@
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::mem;
 use std::time::Instant;
 
 use actix_net::codec::Framed;
 use actix_net::service::Service;
 
-use futures::{Async, AsyncSink, Future, Poll, Sink, Stream};
+use futures::{Async, Future, Poll, Sink, Stream};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::Delay;
 
 use error::{ParseError, PayloadError};
 use payload::{Payload, PayloadSender, PayloadStatus, PayloadWriter};
 
-use body::{Body, BodyStream};
+use body::{Body, BodyLength, MessageBody, ResponseBody};
 use config::ServiceConfig;
 use error::DispatchError;
 use request::Request;
@@ -29,24 +30,30 @@ bitflags! {
         const KEEPALIVE_ENABLED  = 0b0000_0010;
         const KEEPALIVE          = 0b0000_0100;
         const POLLED             = 0b0000_1000;
-        const FLUSHED            = 0b0001_0000;
         const SHUTDOWN           = 0b0010_0000;
         const DISCONNECTED       = 0b0100_0000;
     }
 }
 
 /// Dispatcher for HTTP/1.1 protocol
-pub struct Dispatcher<T, S: Service>
+pub struct Dispatcher<T, S: Service, B: MessageBody>
+where
+    S::Error: Debug,
+{
+    inner: Option<InnerDispatcher<T, S, B>>,
+}
+
+struct InnerDispatcher<T, S: Service, B: MessageBody>
 where
     S::Error: Debug,
 {
     service: S,
     flags: Flags,
-    framed: Option<Framed<T, Codec>>,
+    framed: Framed<T, Codec>,
     error: Option<DispatchError<S::Error>>,
     config: ServiceConfig,
 
-    state: State<S>,
+    state: State<S, B>,
     payload: Option<PayloadSender>,
     messages: VecDeque<DispatcherMessage>,
     unhandled: Option<Request>,
@@ -57,17 +64,16 @@ where
 
 enum DispatcherMessage {
     Item(Request),
-    Error(Response),
+    Error(Response<()>),
 }
 
-enum State<S: Service> {
+enum State<S: Service, B: MessageBody> {
     None,
     ServiceCall(S::Future),
-    SendResponse(Option<(Message<Response>, Body)>),
-    SendPayload(BodyStream),
+    SendPayload(ResponseBody<B>),
 }
 
-impl<S: Service> State<S> {
+impl<S: Service, B: MessageBody> State<S, B> {
     fn is_empty(&self) -> bool {
         if let State::None = self {
             true
@@ -77,11 +83,12 @@ impl<S: Service> State<S> {
     }
 }
 
-impl<T, S> Dispatcher<T, S>
+impl<T, S, B> Dispatcher<T, S, B>
 where
     T: AsyncRead + AsyncWrite,
-    S: Service<Request = Request, Response = Response>,
+    S: Service<Request = Request, Response = Response<B>>,
     S::Error: Debug,
+    B: MessageBody,
 {
     /// Create http/1 dispatcher.
     pub fn new(stream: T, config: ServiceConfig, service: S) -> Self {
@@ -97,9 +104,9 @@ where
     ) -> Self {
         let keepalive = config.keep_alive_enabled();
         let flags = if keepalive {
-            Flags::KEEPALIVE | Flags::KEEPALIVE_ENABLED | Flags::FLUSHED
+            Flags::KEEPALIVE | Flags::KEEPALIVE_ENABLED
         } else {
-            Flags::FLUSHED
+            Flags::empty()
         };
         let framed = Framed::new(stream, Codec::new(config.clone()));
 
@@ -113,20 +120,30 @@ where
         };
 
         Dispatcher {
-            payload: None,
-            state: State::None,
-            error: None,
-            messages: VecDeque::new(),
-            framed: Some(framed),
-            unhandled: None,
-            service,
-            flags,
-            config,
-            ka_expire,
-            ka_timer,
+            inner: Some(InnerDispatcher {
+                framed,
+                payload: None,
+                state: State::None,
+                error: None,
+                messages: VecDeque::new(),
+                unhandled: None,
+                service,
+                flags,
+                config,
+                ka_expire,
+                ka_timer,
+            }),
         }
     }
+}
 
+impl<T, S, B> InnerDispatcher<T, S, B>
+where
+    T: AsyncRead + AsyncWrite,
+    S: Service<Request = Request, Response = Response<B>>,
+    S::Error: Debug,
+    B: MessageBody,
+{
     fn can_read(&self) -> bool {
         if self.flags.contains(Flags::DISCONNECTED) {
             return false;
@@ -149,8 +166,8 @@ where
 
     /// Flush stream
     fn poll_flush(&mut self) -> Poll<(), DispatchError<S::Error>> {
-        if !self.flags.contains(Flags::FLUSHED) {
-            match self.framed.as_mut().unwrap().poll_complete() {
+        if !self.framed.is_write_buf_empty() {
+            match self.framed.poll_complete() {
                 Ok(Async::NotReady) => Ok(Async::NotReady),
                 Err(err) => {
                     debug!("Error sending data: {}", err);
@@ -161,7 +178,6 @@ where
                     if self.payload.is_some() && self.state.is_empty() {
                         return Err(DispatchError::PayloadIsNotConsumed);
                     }
-                    self.flags.insert(Flags::FLUSHED);
                     Ok(Async::Ready(()))
                 }
             }
@@ -170,90 +186,76 @@ where
         }
     }
 
+    fn send_response(
+        &mut self,
+        message: Response<()>,
+        body: ResponseBody<B>,
+    ) -> Result<State<S, B>, DispatchError<S::Error>> {
+        self.framed
+            .force_send(Message::Item((message, body.length())))
+            .map_err(|err| {
+                if let Some(mut payload) = self.payload.take() {
+                    payload.set_error(PayloadError::Incomplete(None));
+                }
+                DispatchError::Io(err)
+            })?;
+
+        self.flags
+            .set(Flags::KEEPALIVE, self.framed.get_codec().keepalive());
+        match body.length() {
+            BodyLength::None | BodyLength::Empty => Ok(State::None),
+            _ => Ok(State::SendPayload(body)),
+        }
+    }
+
     fn poll_response(&mut self) -> Result<(), DispatchError<S::Error>> {
         let mut retry = self.can_read();
-
-        // process
         loop {
-            let state = match self.state {
-                State::None => if let Some(msg) = self.messages.pop_front() {
-                    match msg {
-                        DispatcherMessage::Item(req) => Some(self.handle_request(req)?),
-                        DispatcherMessage::Error(res) => Some(State::SendResponse(
-                            Some((Message::Item(res), Body::Empty)),
-                        )),
+            let state = match mem::replace(&mut self.state, State::None) {
+                State::None => match self.messages.pop_front() {
+                    Some(DispatcherMessage::Item(req)) => {
+                        Some(self.handle_request(req)?)
                     }
-                } else {
-                    None
+                    Some(DispatcherMessage::Error(res)) => {
+                        self.send_response(res, ResponseBody::Other(Body::Empty))?;
+                        None
+                    }
+                    None => None,
                 },
-                // call inner service
-                State::ServiceCall(ref mut fut) => {
+                State::ServiceCall(mut fut) => {
                     match fut.poll().map_err(DispatchError::Service)? {
                         Async::Ready(mut res) => {
-                            self.framed
-                                .as_mut()
-                                .unwrap()
-                                .get_codec_mut()
-                                .prepare_te(&mut res);
-                            let body = res.replace_body(Body::Empty);
-                            Some(State::SendResponse(Some((Message::Item(res), body))))
+                            let (res, body) = res.replace_body(());
+                            Some(self.send_response(res, body)?)
                         }
-                        Async::NotReady => None,
-                    }
-                }
-                // send respons
-                State::SendResponse(ref mut item) => {
-                    let (msg, body) = item.take().expect("SendResponse is empty");
-                    let framed = self.framed.as_mut().unwrap();
-                    match framed.start_send(msg) {
-                        Ok(AsyncSink::Ready) => {
-                            self.flags
-                                .set(Flags::KEEPALIVE, framed.get_codec().keepalive());
-                            self.flags.remove(Flags::FLUSHED);
-                            match body {
-                                Body::Empty => Some(State::None),
-                                Body::Streaming(stream) => {
-                                    Some(State::SendPayload(stream))
-                                }
-                                Body::Binary(mut bin) => {
-                                    self.flags.remove(Flags::FLUSHED);
-                                    framed
-                                        .force_send(Message::Chunk(Some(bin.take())))?;
-                                    framed.force_send(Message::Chunk(None))?;
-                                    Some(State::None)
-                                }
-                            }
-                        }
-                        Ok(AsyncSink::NotReady(msg)) => {
-                            *item = Some((msg, body));
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            if let Some(mut payload) = self.payload.take() {
-                                payload.set_error(PayloadError::Incomplete(None));
-                            }
-                            return Err(DispatchError::Io(err));
+                        Async::NotReady => {
+                            self.state = State::ServiceCall(fut);
+                            None
                         }
                     }
                 }
-                // Send payload
-                State::SendPayload(ref mut stream) => {
-                    let mut framed = self.framed.as_mut().unwrap();
+                State::SendPayload(mut stream) => {
                     loop {
-                        if !framed.is_write_buf_full() {
-                            match stream.poll().map_err(|_| DispatchError::Unknown)? {
+                        if !self.framed.is_write_buf_full() {
+                            match stream
+                                .poll_next()
+                                .map_err(|_| DispatchError::Unknown)?
+                            {
                                 Async::Ready(Some(item)) => {
-                                    self.flags.remove(Flags::FLUSHED);
-                                    framed.force_send(Message::Chunk(Some(item)))?;
+                                    self.framed
+                                        .force_send(Message::Chunk(Some(item)))?;
                                     continue;
                                 }
                                 Async::Ready(None) => {
-                                    self.flags.remove(Flags::FLUSHED);
-                                    framed.force_send(Message::Chunk(None))?;
+                                    self.framed.force_send(Message::Chunk(None))?;
                                 }
-                                Async::NotReady => return Ok(()),
+                                Async::NotReady => {
+                                    self.state = State::SendPayload(stream);
+                                    return Ok(());
+                                }
                             }
                         } else {
+                            self.state = State::SendPayload(stream);
                             return Ok(());
                         }
                         break;
@@ -266,7 +268,7 @@ where
                 Some(state) => self.state = state,
                 None => {
                     // if read-backpressure is enabled and we consumed some data.
-                    // we may read more dataand retry
+                    // we may read more data and retry
                     if !retry && self.can_read() && self.poll_request()? {
                         retry = self.can_read();
                         continue;
@@ -282,17 +284,12 @@ where
     fn handle_request(
         &mut self,
         req: Request,
-    ) -> Result<State<S>, DispatchError<S::Error>> {
+    ) -> Result<State<S, B>, DispatchError<S::Error>> {
         let mut task = self.service.call(req);
         match task.poll().map_err(DispatchError::Service)? {
-            Async::Ready(mut res) => {
-                self.framed
-                    .as_mut()
-                    .unwrap()
-                    .get_codec_mut()
-                    .prepare_te(&mut res);
-                let body = res.replace_body(Body::Empty);
-                Ok(State::SendResponse(Some((Message::Item(res), body))))
+            Async::Ready(res) => {
+                let (res, body) = res.replace_body(());
+                self.send_response(res, body)
             }
             Async::NotReady => Ok(State::ServiceCall(task)),
         }
@@ -307,20 +304,14 @@ where
 
         let mut updated = false;
         loop {
-            match self.framed.as_mut().unwrap().poll() {
+            match self.framed.poll() {
                 Ok(Async::Ready(Some(msg))) => {
                     updated = true;
                     self.flags.insert(Flags::STARTED);
 
                     match msg {
                         Message::Item(req) => {
-                            match self
-                                .framed
-                                .as_ref()
-                                .unwrap()
-                                .get_codec()
-                                .message_type()
-                            {
+                            match self.framed.get_codec().message_type() {
                                 MessageType::Payload => {
                                     let (ps, pl) = Payload::new(false);
                                     *req.inner.payload.borrow_mut() = Some(pl);
@@ -349,7 +340,7 @@ where
                                 );
                                 self.flags.insert(Flags::DISCONNECTED);
                                 self.messages.push_back(DispatcherMessage::Error(
-                                    Response::InternalServerError().finish(),
+                                    Response::InternalServerError().finish().drop_body(),
                                 ));
                                 self.error = Some(DispatchError::InternalError);
                                 break;
@@ -362,7 +353,7 @@ where
                                 error!("Internal server error: unexpected eof");
                                 self.flags.insert(Flags::DISCONNECTED);
                                 self.messages.push_back(DispatcherMessage::Error(
-                                    Response::InternalServerError().finish(),
+                                    Response::InternalServerError().finish().drop_body(),
                                 ));
                                 self.error = Some(DispatchError::InternalError);
                                 break;
@@ -387,7 +378,7 @@ where
 
                     // Malformed requests should be responded with 400
                     self.messages.push_back(DispatcherMessage::Error(
-                        Response::BadRequest().finish(),
+                        Response::BadRequest().finish().drop_body(),
                     ));
                     self.flags.insert(Flags::DISCONNECTED);
                     self.error = Some(e.into());
@@ -406,106 +397,133 @@ where
 
     /// keep-alive timer
     fn poll_keepalive(&mut self) -> Result<(), DispatchError<S::Error>> {
-        if let Some(ref mut timer) = self.ka_timer {
-            match timer.poll() {
-                Ok(Async::Ready(_)) => {
-                    // if we get timer during shutdown, just drop connection
-                    if self.flags.contains(Flags::SHUTDOWN) {
-                        return Err(DispatchError::DisconnectTimeout);
-                    } else if timer.deadline() >= self.ka_expire {
-                        // check for any outstanding response processing
-                        if self.state.is_empty() && self.flags.contains(Flags::FLUSHED) {
-                            if self.flags.contains(Flags::STARTED) {
-                                trace!("Keep-alive timeout, close connection");
-                                self.flags.insert(Flags::SHUTDOWN);
+        if self.ka_timer.is_none() {
+            return Ok(());
+        }
+        match self.ka_timer.as_mut().unwrap().poll().map_err(|e| {
+            error!("Timer error {:?}", e);
+            DispatchError::Unknown
+        })? {
+            Async::Ready(_) => {
+                // if we get timeout during shutdown, drop connection
+                if self.flags.contains(Flags::SHUTDOWN) {
+                    return Err(DispatchError::DisconnectTimeout);
+                } else if self.ka_timer.as_mut().unwrap().deadline() >= self.ka_expire {
+                    // check for any outstanding tasks
+                    if self.state.is_empty() && self.framed.is_write_buf_empty() {
+                        if self.flags.contains(Flags::STARTED) {
+                            trace!("Keep-alive timeout, close connection");
+                            self.flags.insert(Flags::SHUTDOWN);
 
-                                // start shutdown timer
-                                if let Some(deadline) =
-                                    self.config.client_disconnect_timer()
-                                {
+                            // start shutdown timer
+                            if let Some(deadline) = self.config.client_disconnect_timer()
+                            {
+                                self.ka_timer.as_mut().map(|timer| {
                                     timer.reset(deadline);
                                     let _ = timer.poll();
-                                } else {
-                                    return Ok(());
-                                }
+                                });
                             } else {
-                                // timeout on first request (slow request) return 408
-                                trace!("Slow request timeout");
-                                self.flags.insert(Flags::STARTED | Flags::DISCONNECTED);
-                                self.state = State::SendResponse(Some((
-                                    Message::Item(Response::RequestTimeout().finish()),
-                                    Body::Empty,
-                                )));
+                                return Ok(());
                             }
-                        } else if let Some(deadline) = self.config.keep_alive_expire() {
+                        } else {
+                            // timeout on first request (slow request) return 408
+                            if !self.flags.contains(Flags::STARTED) {
+                                trace!("Slow request timeout");
+                                let _ = self.send_response(
+                                    Response::RequestTimeout().finish().drop_body(),
+                                    ResponseBody::Other(Body::Empty),
+                                );
+                            } else {
+                                trace!("Keep-alive connection timeout");
+                            }
+                            self.flags.insert(Flags::STARTED | Flags::SHUTDOWN);
+                            self.state = State::None;
+                        }
+                    } else if let Some(deadline) = self.config.keep_alive_expire() {
+                        self.ka_timer.as_mut().map(|timer| {
                             timer.reset(deadline);
                             let _ = timer.poll();
-                        }
-                    } else {
-                        timer.reset(self.ka_expire);
-                        let _ = timer.poll();
+                        });
                     }
-                }
-                Ok(Async::NotReady) => (),
-                Err(e) => {
-                    error!("Timer error {:?}", e);
-                    return Err(DispatchError::Unknown);
+                } else {
+                    let expire = self.ka_expire;
+                    self.ka_timer.as_mut().map(|timer| {
+                        timer.reset(expire);
+                        let _ = timer.poll();
+                    });
                 }
             }
+            Async::NotReady => (),
         }
 
         Ok(())
     }
 }
 
-impl<T, S> Future for Dispatcher<T, S>
+impl<T, S, B> Future for Dispatcher<T, S, B>
 where
     T: AsyncRead + AsyncWrite,
-    S: Service<Request = Request, Response = Response>,
+    S: Service<Request = Request, Response = Response<B>>,
     S::Error: Debug,
+    B: MessageBody,
 {
     type Item = H1ServiceResult<T>;
     type Error = DispatchError<S::Error>;
 
     #[inline]
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if self.flags.contains(Flags::SHUTDOWN) {
-            self.poll_keepalive()?;
-            try_ready!(self.poll_flush());
-            let io = self.framed.take().unwrap().into_inner();
-            Ok(Async::Ready(H1ServiceResult::Shutdown(io)))
-        } else {
-            self.poll_keepalive()?;
-            self.poll_request()?;
-            self.poll_response()?;
-            self.poll_flush()?;
-
-            // keep-alive and stream errors
-            if self.state.is_empty() && self.flags.contains(Flags::FLUSHED) {
-                if let Some(err) = self.error.take() {
-                    Err(err)
-                } else if self.flags.contains(Flags::DISCONNECTED) {
-                    Ok(Async::Ready(H1ServiceResult::Disconnected))
-                }
-                // unhandled request (upgrade or connect)
-                else if self.unhandled.is_some() {
-                    let req = self.unhandled.take().unwrap();
-                    let framed = self.framed.take().unwrap();
-                    Ok(Async::Ready(H1ServiceResult::Unhandled(req, framed)))
-                }
-                // disconnect if keep-alive is not enabled
-                else if self.flags.contains(Flags::STARTED) && !self
-                    .flags
-                    .intersects(Flags::KEEPALIVE | Flags::KEEPALIVE_ENABLED)
-                {
-                    let io = self.framed.take().unwrap().into_inner();
-                    Ok(Async::Ready(H1ServiceResult::Shutdown(io)))
-                } else {
-                    Ok(Async::NotReady)
-                }
+        let shutdown = if let Some(ref mut inner) = self.inner {
+            if inner.flags.contains(Flags::SHUTDOWN) {
+                inner.poll_keepalive()?;
+                try_ready!(inner.poll_flush());
+                true
             } else {
-                Ok(Async::NotReady)
+                inner.poll_keepalive()?;
+                inner.poll_request()?;
+                inner.poll_response()?;
+                inner.poll_flush()?;
+
+                if inner.flags.contains(Flags::DISCONNECTED) {
+                    return Ok(Async::Ready(H1ServiceResult::Disconnected));
+                }
+
+                // keep-alive and stream errors
+                if inner.state.is_empty() && inner.framed.is_write_buf_empty() {
+                    if let Some(err) = inner.error.take() {
+                        return Err(err);
+                    }
+                    // unhandled request (upgrade or connect)
+                    else if inner.unhandled.is_some() {
+                        false
+                    }
+                    // disconnect if keep-alive is not enabled
+                    else if inner.flags.contains(Flags::STARTED)
+                        && !inner.flags.intersects(Flags::KEEPALIVE)
+                    {
+                        true
+                    }
+                    // disconnect if shutdown
+                    else if inner.flags.contains(Flags::SHUTDOWN) {
+                        true
+                    } else {
+                        return Ok(Async::NotReady);
+                    }
+                } else {
+                    return Ok(Async::NotReady);
+                }
             }
+        } else {
+            unreachable!()
+        };
+
+        let mut inner = self.inner.take().unwrap();
+        if shutdown {
+            Ok(Async::Ready(H1ServiceResult::Shutdown(
+                inner.framed.into_inner(),
+            )))
+        } else {
+            let req = inner.unhandled.take().unwrap();
+            Ok(Async::Ready(H1ServiceResult::Unhandled(req, inner.framed)))
         }
     }
 }

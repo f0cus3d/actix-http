@@ -1,4 +1,6 @@
 //! HTTP/1 implementation
+use std::fmt;
+
 use actix_net::codec::Framed;
 use bytes::Bytes;
 
@@ -11,7 +13,6 @@ mod service;
 
 pub use self::client::{ClientCodec, ClientPayloadCodec};
 pub use self::codec::Codec;
-pub use self::decoder::{PayloadDecoder, RequestDecoder};
 pub use self::dispatcher::Dispatcher;
 pub use self::service::{H1Service, H1ServiceHandler, OneRequest};
 
@@ -22,6 +23,20 @@ pub enum H1ServiceResult<T> {
     Disconnected,
     Shutdown(T),
     Unhandled(Request, Framed<T, Codec>),
+}
+
+impl<T: fmt::Debug> fmt::Debug for H1ServiceResult<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            H1ServiceResult::Disconnected => write!(f, "H1ServiceResult::Disconnected"),
+            H1ServiceResult::Shutdown(ref v) => {
+                write!(f, "H1ServiceResult::Shutdown({:?})", v)
+            }
+            H1ServiceResult::Unhandled(ref req, _) => {
+                write!(f, "H1ServiceResult::Unhandled({:?})", req)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

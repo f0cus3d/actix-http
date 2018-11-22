@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::marker::PhantomData;
 use std::{fmt, mem};
 
 use bytes::{Bytes, BytesMut};
@@ -6,30 +6,30 @@ use futures::{Async, Poll, Stream};
 
 use error::{Error, PayloadError};
 
-/// Type represent streaming body
-pub type BodyStream = Box<dyn Stream<Item = Bytes, Error = Error>>;
-
 /// Type represent streaming payload
 pub type PayloadStream = Box<dyn Stream<Item = Bytes, Error = PayloadError>>;
 
-/// Different type of bory
-pub enum BodyType {
+#[derive(Debug, PartialEq, Copy, Clone)]
+/// Different type of body
+pub enum BodyLength {
     None,
-    Zero,
+    Empty,
     Sized(usize),
-    Unsized,
+    Sized64(u64),
+    Chunked,
+    Stream,
 }
 
 /// Type that provides this trait can be streamed to a peer.
 pub trait MessageBody {
-    fn tp(&self) -> BodyType;
+    fn length(&self) -> BodyLength;
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error>;
 }
 
 impl MessageBody for () {
-    fn tp(&self) -> BodyType {
-        BodyType::Zero
+    fn length(&self) -> BodyLength {
+        BodyLength::Empty
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -37,71 +37,84 @@ impl MessageBody for () {
     }
 }
 
-/// Represents various types of http message body.
-pub enum Body {
-    /// Empty response. `Content-Length` header is set to `0`
-    Empty,
-    /// Specific response body.
-    Binary(Binary),
-    /// Unspecified streaming response. Developer is responsible for setting
-    /// right `Content-Length` or `Transfer-Encoding` headers.
-    Streaming(BodyStream),
+pub enum ResponseBody<B> {
+    Body(B),
+    Other(Body),
 }
 
-/// Represents various types of binary body.
-/// `Content-Length` header is set to length of the body.
-#[derive(Debug, PartialEq)]
-pub enum Binary {
-    /// Bytes body
+impl<B: MessageBody> ResponseBody<B> {
+    pub fn as_ref(&self) -> Option<&B> {
+        if let ResponseBody::Body(ref b) = self {
+            Some(b)
+        } else {
+            None
+        }
+    }
+}
+
+impl<B: MessageBody> MessageBody for ResponseBody<B> {
+    fn length(&self) -> BodyLength {
+        match self {
+            ResponseBody::Body(ref body) => body.length(),
+            ResponseBody::Other(ref body) => body.length(),
+        }
+    }
+
+    fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
+        match self {
+            ResponseBody::Body(ref mut body) => body.poll_next(),
+            ResponseBody::Other(ref mut body) => body.poll_next(),
+        }
+    }
+}
+
+/// Represents various types of http message body.
+pub enum Body {
+    /// Empty response. `Content-Length` header is not set.
+    None,
+    /// Zero sized response body. `Content-Length` header is set to `0`.
+    Empty,
+    /// Specific response body.
     Bytes(Bytes),
-    /// Static slice
-    Slice(&'static [u8]),
-    /// Shared string body
-    #[doc(hidden)]
-    SharedString(Arc<String>),
-    /// Shared vec body
-    SharedVec(Arc<Vec<u8>>),
+    /// Generic message body.
+    Message(Box<dyn MessageBody>),
 }
 
 impl Body {
-    /// Does this body streaming.
-    #[inline]
-    pub fn is_streaming(&self) -> bool {
-        match *self {
-            Body::Streaming(_) => true,
-            _ => false,
-        }
-    }
-
-    /// Is this binary body.
-    #[inline]
-    pub fn is_binary(&self) -> bool {
-        match *self {
-            Body::Binary(_) => true,
-            _ => false,
-        }
-    }
-
-    /// Is this binary empy.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        match *self {
-            Body::Empty => true,
-            _ => false,
-        }
-    }
-
     /// Create body from slice (copy)
     pub fn from_slice(s: &[u8]) -> Body {
-        Body::Binary(Binary::Bytes(Bytes::from(s)))
+        Body::Bytes(Bytes::from(s))
     }
 
-    /// Is this binary body.
-    #[inline]
-    pub(crate) fn into_binary(self) -> Option<Binary> {
+    /// Create body from generic message body.
+    pub fn from_message<B: MessageBody + 'static>(body: B) -> Body {
+        Body::Message(Box::new(body))
+    }
+}
+
+impl MessageBody for Body {
+    fn length(&self) -> BodyLength {
         match self {
-            Body::Binary(b) => Some(b),
-            _ => None,
+            Body::None => BodyLength::None,
+            Body::Empty => BodyLength::Empty,
+            Body::Bytes(ref bin) => BodyLength::Sized(bin.len()),
+            Body::Message(ref body) => body.length(),
+        }
+    }
+
+    fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
+        match self {
+            Body::None => Ok(Async::Ready(None)),
+            Body::Empty => Ok(Async::Ready(None)),
+            Body::Bytes(ref mut bin) => {
+                let len = bin.len();
+                if len == 0 {
+                    Ok(Async::Ready(None))
+                } else {
+                    Ok(Async::Ready(Some(bin.split_to(len))))
+                }
+            }
+            Body::Message(ref mut body) => body.poll_next(),
         }
     }
 }
@@ -109,15 +122,19 @@ impl Body {
 impl PartialEq for Body {
     fn eq(&self, other: &Body) -> bool {
         match *self {
+            Body::None => match *other {
+                Body::None => true,
+                _ => false,
+            },
             Body::Empty => match *other {
                 Body::Empty => true,
                 _ => false,
             },
-            Body::Binary(ref b) => match *other {
-                Body::Binary(ref b2) => b == b2,
+            Body::Bytes(ref b) => match *other {
+                Body::Bytes(ref b2) => b == b2,
                 _ => false,
             },
-            Body::Streaming(_) => false,
+            Body::Message(_) => false,
         }
     }
 }
@@ -125,154 +142,59 @@ impl PartialEq for Body {
 impl fmt::Debug for Body {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Body::Empty => write!(f, "Body::Empty"),
-            Body::Binary(ref b) => write!(f, "Body::Binary({:?})", b),
-            Body::Streaming(_) => write!(f, "Body::Streaming(_)"),
+            Body::None => write!(f, "Body::None"),
+            Body::Empty => write!(f, "Body::Zero"),
+            Body::Bytes(ref b) => write!(f, "Body::Bytes({:?})", b),
+            Body::Message(_) => write!(f, "Body::Message(_)"),
         }
     }
 }
 
-impl<T> From<T> for Body
-where
-    T: Into<Binary>,
-{
-    fn from(b: T) -> Body {
-        Body::Binary(b.into())
+impl From<&'static str> for Body {
+    fn from(s: &'static str) -> Body {
+        Body::Bytes(Bytes::from_static(s.as_ref()))
     }
 }
 
-impl Binary {
-    #[inline]
-    /// Returns `true` if body is empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    /// Length of body in bytes
-    pub fn len(&self) -> usize {
-        match *self {
-            Binary::Bytes(ref bytes) => bytes.len(),
-            Binary::Slice(slice) => slice.len(),
-            Binary::SharedString(ref s) => s.len(),
-            Binary::SharedVec(ref s) => s.len(),
-        }
-    }
-
-    /// Create binary body from slice
-    pub fn from_slice(s: &[u8]) -> Binary {
-        Binary::Bytes(Bytes::from(s))
-    }
-
-    /// Convert Binary to a Bytes instance
-    pub fn take(&mut self) -> Bytes {
-        mem::replace(self, Binary::Slice(b"")).into()
+impl From<&'static [u8]> for Body {
+    fn from(s: &'static [u8]) -> Body {
+        Body::Bytes(Bytes::from_static(s.as_ref()))
     }
 }
 
-impl Clone for Binary {
-    fn clone(&self) -> Binary {
-        match *self {
-            Binary::Bytes(ref bytes) => Binary::Bytes(bytes.clone()),
-            Binary::Slice(slice) => Binary::Bytes(Bytes::from(slice)),
-            Binary::SharedString(ref s) => Binary::SharedString(s.clone()),
-            Binary::SharedVec(ref s) => Binary::SharedVec(s.clone()),
-        }
+impl From<Vec<u8>> for Body {
+    fn from(vec: Vec<u8>) -> Body {
+        Body::Bytes(Bytes::from(vec))
     }
 }
 
-impl Into<Bytes> for Binary {
-    fn into(self) -> Bytes {
-        match self {
-            Binary::Bytes(bytes) => bytes,
-            Binary::Slice(slice) => Bytes::from(slice),
-            Binary::SharedString(s) => Bytes::from(s.as_str()),
-            Binary::SharedVec(s) => Bytes::from(AsRef::<[u8]>::as_ref(s.as_ref())),
-        }
+impl From<String> for Body {
+    fn from(s: String) -> Body {
+        s.into_bytes().into()
     }
 }
 
-impl From<&'static str> for Binary {
-    fn from(s: &'static str) -> Binary {
-        Binary::Slice(s.as_ref())
+impl<'a> From<&'a String> for Body {
+    fn from(s: &'a String) -> Body {
+        Body::Bytes(Bytes::from(AsRef::<[u8]>::as_ref(&s)))
     }
 }
 
-impl From<&'static [u8]> for Binary {
-    fn from(s: &'static [u8]) -> Binary {
-        Binary::Slice(s)
+impl From<Bytes> for Body {
+    fn from(s: Bytes) -> Body {
+        Body::Bytes(s)
     }
 }
 
-impl From<Vec<u8>> for Binary {
-    fn from(vec: Vec<u8>) -> Binary {
-        Binary::Bytes(Bytes::from(vec))
-    }
-}
-
-impl From<String> for Binary {
-    fn from(s: String) -> Binary {
-        Binary::Bytes(Bytes::from(s))
-    }
-}
-
-impl<'a> From<&'a String> for Binary {
-    fn from(s: &'a String) -> Binary {
-        Binary::Bytes(Bytes::from(AsRef::<[u8]>::as_ref(&s)))
-    }
-}
-
-impl From<Bytes> for Binary {
-    fn from(s: Bytes) -> Binary {
-        Binary::Bytes(s)
-    }
-}
-
-impl From<BytesMut> for Binary {
-    fn from(s: BytesMut) -> Binary {
-        Binary::Bytes(s.freeze())
-    }
-}
-
-impl From<Arc<String>> for Binary {
-    fn from(body: Arc<String>) -> Binary {
-        Binary::SharedString(body)
-    }
-}
-
-impl<'a> From<&'a Arc<String>> for Binary {
-    fn from(body: &'a Arc<String>) -> Binary {
-        Binary::SharedString(Arc::clone(body))
-    }
-}
-
-impl From<Arc<Vec<u8>>> for Binary {
-    fn from(body: Arc<Vec<u8>>) -> Binary {
-        Binary::SharedVec(body)
-    }
-}
-
-impl<'a> From<&'a Arc<Vec<u8>>> for Binary {
-    fn from(body: &'a Arc<Vec<u8>>) -> Binary {
-        Binary::SharedVec(Arc::clone(body))
-    }
-}
-
-impl AsRef<[u8]> for Binary {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        match *self {
-            Binary::Bytes(ref bytes) => bytes.as_ref(),
-            Binary::Slice(slice) => slice,
-            Binary::SharedString(ref s) => s.as_bytes(),
-            Binary::SharedVec(ref s) => s.as_ref().as_ref(),
-        }
+impl From<BytesMut> for Body {
+    fn from(s: BytesMut) -> Body {
+        Body::Bytes(s.freeze())
     }
 }
 
 impl MessageBody for Bytes {
-    fn tp(&self) -> BodyType {
-        BodyType::Sized(self.len())
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -284,9 +206,25 @@ impl MessageBody for Bytes {
     }
 }
 
+impl MessageBody for BytesMut {
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
+    }
+
+    fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
+        if self.is_empty() {
+            Ok(Async::Ready(None))
+        } else {
+            Ok(Async::Ready(Some(
+                mem::replace(self, BytesMut::new()).freeze(),
+            )))
+        }
+    }
+}
+
 impl MessageBody for &'static str {
-    fn tp(&self) -> BodyType {
-        BodyType::Sized(self.len())
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -301,8 +239,8 @@ impl MessageBody for &'static str {
 }
 
 impl MessageBody for &'static [u8] {
-    fn tp(&self) -> BodyType {
-        BodyType::Sized(self.len())
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -317,8 +255,8 @@ impl MessageBody for &'static [u8] {
 }
 
 impl MessageBody for Vec<u8> {
-    fn tp(&self) -> BodyType {
-        BodyType::Sized(self.len())
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -334,8 +272,8 @@ impl MessageBody for Vec<u8> {
 }
 
 impl MessageBody for String {
-    fn tp(&self) -> BodyType {
-        BodyType::Sized(self.len())
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.len())
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -349,26 +287,62 @@ impl MessageBody for String {
     }
 }
 
-#[doc(hidden)]
-pub struct MessageBodyStream<S> {
+/// Type represent streaming body.
+/// Response does not contain `content-length` header and appropriate transfer encoding is used.
+pub struct BodyStream<S, E> {
     stream: S,
+    _t: PhantomData<E>,
 }
 
-impl<S> MessageBodyStream<S>
+impl<S, E> BodyStream<S, E>
 where
-    S: Stream<Item = Bytes, Error = Error>,
+    S: Stream<Item = Bytes, Error = E>,
+    E: Into<Error>,
 {
     pub fn new(stream: S) -> Self {
-        MessageBodyStream { stream }
+        BodyStream {
+            stream,
+            _t: PhantomData,
+        }
     }
 }
 
-impl<S> MessageBody for MessageBodyStream<S>
+impl<S, E> MessageBody for BodyStream<S, E>
+where
+    S: Stream<Item = Bytes, Error = E>,
+    E: Into<Error>,
+{
+    fn length(&self) -> BodyLength {
+        BodyLength::Chunked
+    }
+
+    fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
+        self.stream.poll().map_err(|e| e.into())
+    }
+}
+
+/// Type represent streaming body. This body implementation should be used
+/// if total size of stream is known. Data get sent as is without using transfer encoding.
+pub struct SizedStream<S> {
+    size: usize,
+    stream: S,
+}
+
+impl<S> SizedStream<S>
 where
     S: Stream<Item = Bytes, Error = Error>,
 {
-    fn tp(&self) -> BodyType {
-        BodyType::Unsized
+    pub fn new(size: usize, stream: S) -> Self {
+        SizedStream { size, stream }
+    }
+}
+
+impl<S> MessageBody for SizedStream<S>
+where
+    S: Stream<Item = Bytes, Error = Error>,
+{
+    fn length(&self) -> BodyLength {
+        BodyLength::Sized(self.size)
     }
 
     fn poll_next(&mut self) -> Poll<Option<Bytes>, Error> {
@@ -380,84 +354,70 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_body_is_streaming() {
-        assert_eq!(Body::Empty.is_streaming(), false);
-        assert_eq!(Body::Binary(Binary::from("")).is_streaming(), false);
+    impl Body {
+        pub(crate) fn get_ref(&self) -> &[u8] {
+            match *self {
+                Body::Bytes(ref bin) => &bin,
+                _ => panic!(),
+            }
+        }
     }
 
-    #[test]
-    fn test_is_empty() {
-        assert_eq!(Binary::from("").is_empty(), true);
-        assert_eq!(Binary::from("test").is_empty(), false);
+    impl ResponseBody<Body> {
+        pub(crate) fn get_ref(&self) -> &[u8] {
+            match *self {
+                ResponseBody::Body(ref b) => b.get_ref(),
+                ResponseBody::Other(ref b) => b.get_ref(),
+            }
+        }
     }
 
     #[test]
     fn test_static_str() {
-        assert_eq!(Binary::from("test").len(), 4);
-        assert_eq!(Binary::from("test").as_ref(), b"test");
+        assert_eq!(Body::from("").length(), BodyLength::Sized(0));
+        assert_eq!(Body::from("test").length(), BodyLength::Sized(4));
+        assert_eq!(Body::from("test").get_ref(), b"test");
     }
 
     #[test]
     fn test_static_bytes() {
-        assert_eq!(Binary::from(b"test".as_ref()).len(), 4);
-        assert_eq!(Binary::from(b"test".as_ref()).as_ref(), b"test");
-        assert_eq!(Binary::from_slice(b"test".as_ref()).len(), 4);
-        assert_eq!(Binary::from_slice(b"test".as_ref()).as_ref(), b"test");
+        assert_eq!(Body::from(b"test".as_ref()).length(), BodyLength::Sized(4));
+        assert_eq!(Body::from(b"test".as_ref()).get_ref(), b"test");
+        assert_eq!(
+            Body::from_slice(b"test".as_ref()).length(),
+            BodyLength::Sized(4)
+        );
+        assert_eq!(Body::from_slice(b"test".as_ref()).get_ref(), b"test");
     }
 
     #[test]
     fn test_vec() {
-        assert_eq!(Binary::from(Vec::from("test")).len(), 4);
-        assert_eq!(Binary::from(Vec::from("test")).as_ref(), b"test");
+        assert_eq!(Body::from(Vec::from("test")).length(), BodyLength::Sized(4));
+        assert_eq!(Body::from(Vec::from("test")).get_ref(), b"test");
     }
 
     #[test]
     fn test_bytes() {
-        assert_eq!(Binary::from(Bytes::from("test")).len(), 4);
-        assert_eq!(Binary::from(Bytes::from("test")).as_ref(), b"test");
-    }
-
-    #[test]
-    fn test_arc_string() {
-        let b = Arc::new("test".to_owned());
-        assert_eq!(Binary::from(b.clone()).len(), 4);
-        assert_eq!(Binary::from(b.clone()).as_ref(), b"test");
-        assert_eq!(Binary::from(&b).len(), 4);
-        assert_eq!(Binary::from(&b).as_ref(), b"test");
+        assert_eq!(
+            Body::from(Bytes::from("test")).length(),
+            BodyLength::Sized(4)
+        );
+        assert_eq!(Body::from(Bytes::from("test")).get_ref(), b"test");
     }
 
     #[test]
     fn test_string() {
         let b = "test".to_owned();
-        assert_eq!(Binary::from(b.clone()).len(), 4);
-        assert_eq!(Binary::from(b.clone()).as_ref(), b"test");
-        assert_eq!(Binary::from(&b).len(), 4);
-        assert_eq!(Binary::from(&b).as_ref(), b"test");
-    }
-
-    #[test]
-    fn test_shared_vec() {
-        let b = Arc::new(Vec::from(&b"test"[..]));
-        assert_eq!(Binary::from(b.clone()).len(), 4);
-        assert_eq!(Binary::from(b.clone()).as_ref(), &b"test"[..]);
-        assert_eq!(Binary::from(&b).len(), 4);
-        assert_eq!(Binary::from(&b).as_ref(), &b"test"[..]);
+        assert_eq!(Body::from(b.clone()).length(), BodyLength::Sized(4));
+        assert_eq!(Body::from(b.clone()).get_ref(), b"test");
+        assert_eq!(Body::from(&b).length(), BodyLength::Sized(4));
+        assert_eq!(Body::from(&b).get_ref(), b"test");
     }
 
     #[test]
     fn test_bytes_mut() {
         let b = BytesMut::from("test");
-        assert_eq!(Binary::from(b.clone()).len(), 4);
-        assert_eq!(Binary::from(b).as_ref(), b"test");
-    }
-
-    #[test]
-    fn test_binary_into() {
-        let bytes = Bytes::from_static(b"test");
-        let b: Bytes = Binary::from("test").into();
-        assert_eq!(b, bytes);
-        let b: Bytes = Binary::from(bytes.clone()).into();
-        assert_eq!(b, bytes);
+        assert_eq!(Body::from(b.clone()).length(), BodyLength::Sized(4));
+        assert_eq!(Body::from(b).get_ref(), b"test");
     }
 }

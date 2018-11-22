@@ -7,16 +7,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use cookie::{Cookie, CookieJar};
 use futures::{Future, Stream};
 use percent_encoding::{percent_encode, USERINFO_ENCODE_SET};
-use tokio_io::{AsyncRead, AsyncWrite};
 use urlcrate::Url;
 
-use body::{MessageBody, MessageBodyStream};
+use body::{BodyStream, MessageBody};
 use error::Error;
 use header::{self, Header, IntoHeaderValue};
 use http::{
     uri, Error as HttpError, HeaderMap, HeaderName, HeaderValue, HttpTryFrom, Method,
     Uri, Version,
 };
+use message::{ConnectionType, Head, RequestHead};
 
 use super::response::ClientResponse;
 use super::{pipeline, Connect, Connection, ConnectorError, SendRequestError};
@@ -49,24 +49,6 @@ use super::{pipeline, Connect, Connection, ConnectorError, SendRequestError};
 pub struct ClientRequest<B: MessageBody = ()> {
     head: RequestHead,
     body: B,
-}
-
-pub struct RequestHead {
-    pub uri: Uri,
-    pub method: Method,
-    pub version: Version,
-    pub headers: HeaderMap,
-}
-
-impl Default for RequestHead {
-    fn default() -> RequestHead {
-        RequestHead {
-            uri: Uri::default(),
-            method: Method::default(),
-            version: Version::HTTP_11,
-            headers: HeaderMap::with_capacity(16),
-        }
-    }
 }
 
 impl ClientRequest<()> {
@@ -176,13 +158,13 @@ where
     // Send request
     ///
     /// This method returns a future that resolves to a ClientResponse
-    pub fn send<T, Io>(
+    pub fn send<T, I>(
         self,
         connector: &mut T,
     ) -> impl Future<Item = ClientResponse, Error = SendRequestError>
     where
-        T: Service<Request = Connect, Response = Connection<Io>, Error = ConnectorError>,
-        Io: AsyncRead + AsyncWrite + 'static,
+        T: Service<Request = Connect, Response = I, Error = ConnectorError>,
+        I: Connection,
     {
         pipeline::send_request(self.head, self.body, connector)
     }
@@ -383,8 +365,21 @@ impl ClientRequestBuilder {
     where
         V: IntoHeaderValue,
     {
+        {
+            if let Some(parts) = parts(&mut self.head, &self.err) {
+                parts.set_connection_type(ConnectionType::Upgrade);
+            }
+        }
         self.set_header(header::UPGRADE, value)
-            .set_header(header::CONNECTION, "upgrade")
+    }
+
+    /// Close connection
+    #[inline]
+    pub fn close(&mut self) -> &mut Self {
+        if let Some(parts) = parts(&mut self.head, &self.err) {
+            parts.set_connection_type(ConnectionType::Close);
+        }
+        self
     }
 
     /// Set request's content type
@@ -552,14 +547,15 @@ impl ClientRequestBuilder {
     /// Set an streaming body and generate `ClientRequest`.
     ///
     /// `ClientRequestBuilder` can not be used after this call.
-    pub fn stream<S>(
+    pub fn stream<S, E>(
         &mut self,
         stream: S,
     ) -> Result<ClientRequest<impl MessageBody>, HttpError>
     where
-        S: Stream<Item = Bytes, Error = Error>,
+        S: Stream<Item = Bytes, Error = E>,
+        E: Into<Error> + 'static,
     {
-        self.body(MessageBodyStream::new(stream))
+        self.body(BodyStream::new(stream))
     }
 
     /// Set an empty body and generate `ClientRequest`.

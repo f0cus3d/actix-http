@@ -76,8 +76,6 @@ extern crate bitflags;
 #[macro_use]
 extern crate failure;
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate futures;
 extern crate cookie;
 extern crate encoding;
@@ -109,7 +107,7 @@ extern crate serde_derive;
 #[cfg(feature = "ssl")]
 extern crate openssl;
 
-mod body;
+pub mod body;
 pub mod client;
 mod config;
 mod extensions;
@@ -117,18 +115,18 @@ mod header;
 mod httpcodes;
 mod httpmessage;
 mod json;
+mod message;
 mod payload;
 mod request;
 mod response;
 mod service;
-pub mod uri;
 
 pub mod error;
 pub mod h1;
 pub(crate) mod helpers;
 pub mod test;
 pub mod ws;
-pub use body::{Binary, Body};
+pub use body::{Body, MessageBody};
 pub use error::{Error, ResponseError, Result};
 pub use extensions::Extensions;
 pub use httpmessage::HttpMessage;
@@ -149,7 +147,6 @@ pub mod dev {
     //! use actix_http::dev::*;
     //! ```
 
-    pub use body::BodyStream;
     pub use httpmessage::{MessageBody, Readlines, UrlEncoded};
     pub use json::JsonBody;
     pub use payload::{Payload, PayloadBuffer};
@@ -173,5 +170,5 @@ pub mod http {
         pub use header::*;
     }
     pub use header::ContentEncoding;
-    pub use response::ConnectionType;
+    pub use message::ConnectionType;
 }

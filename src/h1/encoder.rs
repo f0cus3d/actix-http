@@ -1,193 +1,217 @@
 #![allow(unused_imports, unused_variables, dead_code)]
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::str::FromStr;
 use std::{cmp, fmt, io, mem};
 
-use bytes::{Bytes, BytesMut};
-use http::header::{HeaderValue, ACCEPT_ENCODING, CONTENT_LENGTH};
-use http::{StatusCode, Version};
+use bytes::{BufMut, Bytes, BytesMut};
+use http::header::{
+    HeaderValue, ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING,
+};
+use http::{HeaderMap, StatusCode, Version};
 
-use body::{Binary, Body};
-use client::RequestHead;
+use body::BodyLength;
+use config::ServiceConfig;
 use header::ContentEncoding;
+use helpers;
 use http::Method;
+use message::{ConnectionType, RequestHead, ResponseHead};
 use request::Request;
 use response::Response;
 
-#[derive(Debug)]
-pub(crate) enum ResponseLength {
-    Chunked,
-    /// Check if headers contains length or write 0
-    Zero,
-    Length(usize),
-    Length64(u64),
-    /// Do no set content-length
-    None,
-}
+const AVERAGE_HEADER_SIZE: usize = 30;
 
 #[derive(Debug)]
-pub(crate) struct ResponseEncoder {
-    head: bool,
-    pub length: ResponseLength,
+pub(crate) struct MessageEncoder<T: MessageType> {
+    pub length: BodyLength,
     pub te: TransferEncoding,
+    _t: PhantomData<T>,
 }
 
-impl Default for ResponseEncoder {
+impl<T: MessageType> Default for MessageEncoder<T> {
     fn default() -> Self {
-        ResponseEncoder {
-            head: false,
-            length: ResponseLength::None,
+        MessageEncoder {
+            length: BodyLength::None,
             te: TransferEncoding::empty(),
+            _t: PhantomData,
         }
     }
 }
 
-impl ResponseEncoder {
-    /// Encode message
-    pub fn encode(&mut self, msg: &[u8], buf: &mut BytesMut) -> io::Result<bool> {
-        self.te.encode(msg, buf)
-    }
+pub(crate) trait MessageType: Sized {
+    fn status(&self) -> Option<StatusCode>;
 
-    /// Encode eof
-    pub fn encode_eof(&mut self, buf: &mut BytesMut) -> io::Result<()> {
-        self.te.encode_eof(buf)
-    }
+    fn connection_type(&self) -> Option<ConnectionType>;
 
-    pub fn update(&mut self, resp: &mut Response, head: bool, version: Version) {
-        self.head = head;
+    fn headers(&self) -> &HeaderMap;
 
-        let version = resp.version().unwrap_or_else(|| version);
-        let mut len = 0;
+    fn encode_status(&mut self, dst: &mut BytesMut) -> io::Result<()>;
 
-        let has_body = match resp.body() {
-            Body::Empty => false,
-            Body::Binary(ref bin) => {
-                len = bin.len();
-                true
-            }
-            _ => true,
-        };
-
-        let has_body = match resp.body() {
-            Body::Empty => false,
-            _ => true,
-        };
-
-        let transfer = match resp.body() {
-            Body::Empty => {
-                self.length = match resp.status() {
-                    StatusCode::NO_CONTENT
-                    | StatusCode::CONTINUE
-                    | StatusCode::SWITCHING_PROTOCOLS
-                    | StatusCode::PROCESSING => ResponseLength::None,
-                    _ => ResponseLength::Zero,
-                };
-                TransferEncoding::empty()
-            }
-            Body::Binary(_) => {
-                self.length = ResponseLength::Length(len);
-                TransferEncoding::length(len as u64)
-            }
-            Body::Streaming(_) => {
-                if resp.upgrade() {
-                    self.length = ResponseLength::None;
-                    TransferEncoding::eof()
-                } else {
-                    self.streaming_encoding(version, resp)
-                }
-            }
-        };
-        // check for head response
-        if self.head {
-            resp.set_body(Body::Empty);
-        } else {
-            self.te = transfer;
-        }
-    }
-
-    fn streaming_encoding(
+    fn encode_headers(
         &mut self,
+        dst: &mut BytesMut,
         version: Version,
-        resp: &mut Response,
-    ) -> TransferEncoding {
-        match resp.chunked() {
-            Some(true) => {
-                // Enable transfer encoding
-                if version == Version::HTTP_2 {
-                    self.length = ResponseLength::None;
-                    TransferEncoding::eof()
-                } else {
-                    self.length = ResponseLength::Chunked;
-                    TransferEncoding::chunked()
-                }
-            }
-            Some(false) => TransferEncoding::eof(),
-            None => {
-                // if Content-Length is specified, then use it as length hint
-                let (len, chunked) =
-                    if let Some(len) = resp.headers().get(CONTENT_LENGTH) {
-                        // Content-Length
-                        if let Ok(s) = len.to_str() {
-                            if let Ok(len) = s.parse::<u64>() {
-                                (Some(len), false)
-                            } else {
-                                error!("illegal Content-Length: {:?}", len);
-                                (None, false)
-                            }
-                        } else {
-                            error!("illegal Content-Length: {:?}", len);
-                            (None, false)
-                        }
-                    } else {
-                        (None, true)
-                    };
+        mut length: BodyLength,
+        ctype: ConnectionType,
+        config: &ServiceConfig,
+    ) -> io::Result<()> {
+        let mut skip_len = length != BodyLength::Stream;
 
-                if !chunked {
-                    if let Some(len) = len {
-                        self.length = ResponseLength::Length64(len);
-                        TransferEncoding::length(len)
-                    } else {
-                        TransferEncoding::eof()
-                    }
-                } else {
-                    // Enable transfer encoding
-                    match version {
-                        Version::HTTP_11 => {
-                            self.length = ResponseLength::Chunked;
-                            TransferEncoding::chunked()
-                        }
-                        _ => {
-                            self.length = ResponseLength::None;
-                            TransferEncoding::eof()
-                        }
-                    }
+        // Content length
+        if let Some(status) = self.status() {
+            match status {
+                StatusCode::NO_CONTENT
+                | StatusCode::CONTINUE
+                | StatusCode::PROCESSING => length = BodyLength::None,
+                StatusCode::SWITCHING_PROTOCOLS => {
+                    skip_len = true;
+                    length = BodyLength::Stream;
                 }
+                _ => (),
             }
         }
+        match length {
+            BodyLength::Chunked => {
+                dst.extend_from_slice(b"\r\ntransfer-encoding: chunked\r\n")
+            }
+            BodyLength::Empty => {
+                dst.extend_from_slice(b"\r\ncontent-length: 0\r\n");
+            }
+            BodyLength::Sized(len) => helpers::write_content_length(len, dst),
+            BodyLength::Sized64(len) => {
+                dst.extend_from_slice(b"\r\ncontent-length: ");
+                write!(dst.writer(), "{}", len)?;
+                dst.extend_from_slice(b"\r\n");
+            }
+            BodyLength::None | BodyLength::Stream => dst.extend_from_slice(b"\r\n"),
+        }
+
+        // Connection
+        match ctype {
+            ConnectionType::Upgrade => dst.extend_from_slice(b"connection: upgrade\r\n"),
+            ConnectionType::KeepAlive if version < Version::HTTP_11 => {
+                dst.extend_from_slice(b"connection: keep-alive\r\n")
+            }
+            ConnectionType::Close if version >= Version::HTTP_11 => {
+                dst.extend_from_slice(b"connection: close\r\n")
+            }
+            _ => (),
+        }
+
+        // write headers
+        let mut pos = 0;
+        let mut has_date = false;
+        let mut remaining = dst.remaining_mut();
+        let mut buf = unsafe { &mut *(dst.bytes_mut() as *mut [u8]) };
+        for (key, value) in self.headers() {
+            match key {
+                &CONNECTION => continue,
+                &TRANSFER_ENCODING | &CONTENT_LENGTH if skip_len => continue,
+                &DATE => {
+                    has_date = true;
+                }
+                _ => (),
+            }
+
+            let v = value.as_ref();
+            let k = key.as_str().as_bytes();
+            let len = k.len() + v.len() + 4;
+            if len > remaining {
+                unsafe {
+                    dst.advance_mut(pos);
+                }
+                pos = 0;
+                dst.reserve(len);
+                remaining = dst.remaining_mut();
+                unsafe {
+                    buf = &mut *(dst.bytes_mut() as *mut _);
+                }
+            }
+
+            buf[pos..pos + k.len()].copy_from_slice(k);
+            pos += k.len();
+            buf[pos..pos + 2].copy_from_slice(b": ");
+            pos += 2;
+            buf[pos..pos + v.len()].copy_from_slice(v);
+            pos += v.len();
+            buf[pos..pos + 2].copy_from_slice(b"\r\n");
+            pos += 2;
+            remaining -= len;
+        }
+        unsafe {
+            dst.advance_mut(pos);
+        }
+
+        // optimized date header, set_date writes \r\n
+        if !has_date {
+            config.set_date(dst);
+        } else {
+            // msg eof
+            dst.extend_from_slice(b"\r\n");
+        }
+
+        Ok(())
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct RequestEncoder {
-    head: bool,
-    pub length: ResponseLength,
-    pub te: TransferEncoding,
-}
+impl MessageType for Response<()> {
+    fn status(&self) -> Option<StatusCode> {
+        Some(self.head().status)
+    }
 
-impl Default for RequestEncoder {
-    fn default() -> Self {
-        RequestEncoder {
-            head: false,
-            length: ResponseLength::None,
-            te: TransferEncoding::empty(),
-        }
+    fn connection_type(&self) -> Option<ConnectionType> {
+        self.head().ctype
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        &self.head().headers
+    }
+
+    fn encode_status(&mut self, dst: &mut BytesMut) -> io::Result<()> {
+        let head = self.head();
+        let reason = head.reason().as_bytes();
+        dst.reserve(256 + head.headers.len() * AVERAGE_HEADER_SIZE + reason.len());
+
+        // status line
+        helpers::write_status_line(head.version, head.status.as_u16(), dst);
+        dst.extend_from_slice(reason);
+        Ok(())
     }
 }
 
-impl RequestEncoder {
+impl MessageType for RequestHead {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
+
+    fn connection_type(&self) -> Option<ConnectionType> {
+        self.ctype
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    fn encode_status(&mut self, dst: &mut BytesMut) -> io::Result<()> {
+        write!(
+            Writer(dst),
+            "{} {} {}",
+            self.method,
+            self.uri.path_and_query().map(|u| u.as_str()).unwrap_or("/"),
+            match self.version {
+                Version::HTTP_09 => "HTTP/0.9",
+                Version::HTTP_10 => "HTTP/1.0",
+                Version::HTTP_11 => "HTTP/1.1",
+                Version::HTTP_2 => "HTTP/2.0",
+            }
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
+impl<T: MessageType> MessageEncoder<T> {
     /// Encode message
-    pub fn encode(&mut self, msg: &[u8], buf: &mut BytesMut) -> io::Result<bool> {
+    pub fn encode_chunk(&mut self, msg: &[u8], buf: &mut BytesMut) -> io::Result<bool> {
         self.te.encode(msg, buf)
     }
 
@@ -196,8 +220,32 @@ impl RequestEncoder {
         self.te.encode_eof(buf)
     }
 
-    pub fn update(&mut self, resp: &mut RequestHead, head: bool, version: Version) {
-        self.head = head;
+    pub fn encode(
+        &mut self,
+        dst: &mut BytesMut,
+        message: &mut T,
+        head: bool,
+        version: Version,
+        length: BodyLength,
+        ctype: ConnectionType,
+        config: &ServiceConfig,
+    ) -> io::Result<()> {
+        // transfer encoding
+        if !head {
+            self.te = match length {
+                BodyLength::Empty => TransferEncoding::empty(),
+                BodyLength::Sized(len) => TransferEncoding::length(len as u64),
+                BodyLength::Sized64(len) => TransferEncoding::length(len),
+                BodyLength::Chunked => TransferEncoding::chunked(),
+                BodyLength::Stream => TransferEncoding::eof(),
+                BodyLength::None => TransferEncoding::empty(),
+            };
+        } else {
+            self.te = TransferEncoding::empty();
+        }
+
+        message.encode_status(dst)?;
+        message.encode_headers(dst, version, length, ctype, config)
     }
 }
 
@@ -225,7 +273,7 @@ impl TransferEncoding {
     #[inline]
     pub fn empty() -> TransferEncoding {
         TransferEncoding {
-            kind: TransferEncodingKind::Eof,
+            kind: TransferEncodingKind::Length(0),
         }
     }
 

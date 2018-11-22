@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::{fmt, mem, str};
+use std::{fmt, str};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use cookie::{Cookie, CookieJar};
@@ -12,38 +12,18 @@ use http::{Error as HttpError, HeaderMap, HttpTryFrom, StatusCode, Version};
 use serde::Serialize;
 use serde_json;
 
-use body::Body;
+use body::{Body, BodyStream, MessageBody, ResponseBody};
 use error::Error;
-use header::{ContentEncoding, Header, IntoHeaderValue};
+use header::{Header, IntoHeaderValue};
+use message::{ConnectionType, Head, ResponseHead};
 
 /// max write buffer size 64k
 pub(crate) const MAX_WRITE_BUFFER_SIZE: usize = 65_536;
 
-/// Represents various types of connection
-#[derive(Copy, Clone, PartialEq, Debug)]
-pub enum ConnectionType {
-    /// Close connection after response
-    Close,
-    /// Keep connection alive after response
-    KeepAlive,
-    /// Connection is upgraded to different type
-    Upgrade,
-}
-
 /// An HTTP Response
-pub struct Response(Box<InnerResponse>, &'static ResponsePool);
+pub struct Response<B: MessageBody = Body>(Box<InnerResponse>, ResponseBody<B>);
 
-impl Response {
-    #[inline]
-    fn get_ref(&self) -> &InnerResponse {
-        self.0.as_ref()
-    }
-
-    #[inline]
-    fn get_mut(&mut self) -> &mut InnerResponse {
-        self.0.as_mut()
-    }
-
+impl Response<Body> {
     /// Create http response builder with specific status.
     #[inline]
     pub fn build(status: StatusCode) -> ResponseBuilder {
@@ -60,12 +40,6 @@ impl Response {
     #[inline]
     pub fn new(status: StatusCode) -> Response {
         ResponsePool::with_body(status, Body::Empty)
-    }
-
-    /// Constructs a response with body
-    #[inline]
-    pub fn with_body<B: Into<Body>>(status: StatusCode, body: B) -> Response {
-        ResponsePool::with_body(status, body.into())
     }
 
     /// Constructs an error response
@@ -92,11 +66,49 @@ impl Response {
         }
 
         ResponseBuilder {
-            pool: self.1,
             response: Some(self.0),
             err: None,
             cookies: jar,
         }
+    }
+
+    /// Convert response to response with body
+    pub fn into_body<B: MessageBody>(self) -> Response<B> {
+        let b = match self.1 {
+            ResponseBody::Body(b) => b,
+            ResponseBody::Other(b) => b,
+        };
+        Response(self.0, ResponseBody::Other(b))
+    }
+}
+
+impl<B: MessageBody> Response<B> {
+    #[inline]
+    fn get_ref(&self) -> &InnerResponse {
+        self.0.as_ref()
+    }
+
+    #[inline]
+    fn get_mut(&mut self) -> &mut InnerResponse {
+        self.0.as_mut()
+    }
+
+    #[inline]
+    /// Http message part of the response
+    pub fn head(&self) -> &ResponseHead {
+        &self.0.as_ref().head
+    }
+
+    #[inline]
+    /// Mutable reference to a http message part of the response
+    pub fn head_mut(&mut self) -> &mut ResponseHead {
+        &mut self.0.as_mut().head
+    }
+
+    /// Constructs a response with body
+    #[inline]
+    pub fn with_body(status: StatusCode, body: B) -> Response<B> {
+        ResponsePool::with_body(status, body.into())
     }
 
     /// The source `error` for this response
@@ -105,36 +117,47 @@ impl Response {
         self.get_ref().error.as_ref()
     }
 
-    /// Get the HTTP version of this response
+    /// Get the response status code
     #[inline]
-    pub fn version(&self) -> Option<Version> {
-        self.get_ref().version
+    pub fn status(&self) -> StatusCode {
+        self.get_ref().head.status
+    }
+
+    /// Set the `StatusCode` for this response
+    #[inline]
+    pub fn status_mut(&mut self) -> &mut StatusCode {
+        &mut self.get_mut().head.status
     }
 
     /// Get the headers from the response
     #[inline]
     pub fn headers(&self) -> &HeaderMap {
-        &self.get_ref().headers
+        &self.get_ref().head.headers
     }
 
     /// Get a mutable reference to the headers
     #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
-        &mut self.get_mut().headers
+        &mut self.get_mut().head.headers
     }
 
     /// Get an iterator for the cookies set by this response
     #[inline]
     pub fn cookies(&self) -> CookieIter {
         CookieIter {
-            iter: self.get_ref().headers.get_all(header::SET_COOKIE).iter(),
+            iter: self
+                .get_ref()
+                .head
+                .headers
+                .get_all(header::SET_COOKIE)
+                .iter(),
         }
     }
 
     /// Add a cookie to this response
     #[inline]
     pub fn add_cookie(&mut self, cookie: &Cookie) -> Result<(), HttpError> {
-        let h = &mut self.get_mut().headers;
+        let h = &mut self.get_mut().head.headers;
         HeaderValue::from_str(&cookie.to_string())
             .map(|c| {
                 h.append(header::SET_COOKIE, c);
@@ -145,7 +168,7 @@ impl Response {
     /// the number of cookies removed.
     #[inline]
     pub fn del_cookie(&mut self, name: &str) -> usize {
-        let h = &mut self.get_mut().headers;
+        let h = &mut self.get_mut().head.headers;
         let vals: Vec<HeaderValue> = h
             .get_all(header::SET_COOKIE)
             .iter()
@@ -168,94 +191,39 @@ impl Response {
         count
     }
 
-    /// Get the response status code
-    #[inline]
-    pub fn status(&self) -> StatusCode {
-        self.get_ref().status
-    }
-
-    /// Set the `StatusCode` for this response
-    #[inline]
-    pub fn status_mut(&mut self) -> &mut StatusCode {
-        &mut self.get_mut().status
-    }
-
-    /// Get custom reason for the response
-    #[inline]
-    pub fn reason(&self) -> &str {
-        if let Some(reason) = self.get_ref().reason {
-            reason
-        } else {
-            self.get_ref()
-                .status
-                .canonical_reason()
-                .unwrap_or("<unknown status code>")
-        }
-    }
-
-    /// Set the custom reason for the response
-    #[inline]
-    pub fn set_reason(&mut self, reason: &'static str) -> &mut Self {
-        self.get_mut().reason = Some(reason);
-        self
-    }
-
-    /// Set connection type
-    pub fn set_connection_type(&mut self, conn: ConnectionType) -> &mut Self {
-        self.get_mut().connection_type = Some(conn);
-        self
-    }
-
     /// Connection upgrade status
     #[inline]
     pub fn upgrade(&self) -> bool {
-        self.get_ref().connection_type == Some(ConnectionType::Upgrade)
+        self.get_ref().head.upgrade()
     }
 
     /// Keep-alive status for this connection
-    pub fn keep_alive(&self) -> Option<bool> {
-        if let Some(ct) = self.get_ref().connection_type {
-            match ct {
-                ConnectionType::KeepAlive => Some(true),
-                ConnectionType::Close | ConnectionType::Upgrade => Some(false),
-            }
-        } else {
-            None
-        }
-    }
-
-    /// is chunked encoding enabled
-    #[inline]
-    pub fn chunked(&self) -> Option<bool> {
-        self.get_ref().chunked
-    }
-
-    /// Content encoding
-    #[inline]
-    pub fn content_encoding(&self) -> Option<ContentEncoding> {
-        self.get_ref().encoding
-    }
-
-    /// Set content encoding
-    pub fn set_content_encoding(&mut self, enc: ContentEncoding) -> &mut Self {
-        self.get_mut().encoding = Some(enc);
-        self
+    pub fn keep_alive(&self) -> bool {
+        self.get_ref().head.keep_alive()
     }
 
     /// Get body os this response
     #[inline]
-    pub fn body(&self) -> &Body {
-        &self.get_ref().body
+    pub(crate) fn body(&self) -> &ResponseBody<B> {
+        &self.1
     }
 
     /// Set a body
-    pub fn set_body<B: Into<Body>>(&mut self, body: B) {
-        self.get_mut().body = body.into();
+    pub(crate) fn set_body<B2: MessageBody>(self, body: B2) -> Response<B2> {
+        Response(self.0, ResponseBody::Body(body))
+    }
+
+    /// Drop request's body
+    pub(crate) fn drop_body(self) -> Response<()> {
+        Response(self.0, ResponseBody::Body(()))
     }
 
     /// Set a body and return previous body value
-    pub fn replace_body<B: Into<Body>>(&mut self, body: B) -> Body {
-        mem::replace(&mut self.get_mut().body, body.into())
+    pub(crate) fn replace_body<B2: MessageBody>(
+        self,
+        body: B2,
+    ) -> (Response<B2>, ResponseBody<B>) {
+        (Response(self.0, ResponseBody::Body(body)), self.1)
     }
 
     /// Size of response in bytes, excluding HTTP headers
@@ -263,23 +231,13 @@ impl Response {
         self.get_ref().response_size
     }
 
-    /// Set content encoding
+    /// Set response size
     pub(crate) fn set_response_size(&mut self, size: u64) {
         self.get_mut().response_size = size;
     }
 
-    /// Set write buffer capacity
-    pub fn write_buffer_capacity(&self) -> usize {
-        self.get_ref().write_capacity
-    }
-
-    /// Set write buffer capacity
-    pub fn set_write_buffer_capacity(&mut self, cap: usize) {
-        self.get_mut().write_capacity = cap;
-    }
-
     pub(crate) fn release(self) {
-        self.1.release(self.0);
+        ResponsePool::release(self.0);
     }
 
     pub(crate) fn into_parts(self) -> ResponseParts {
@@ -289,25 +247,25 @@ impl Response {
     pub(crate) fn from_parts(parts: ResponseParts) -> Response {
         Response(
             Box::new(InnerResponse::from_parts(parts)),
-            ResponsePool::get_pool(),
+            ResponseBody::Body(Body::Empty),
         )
     }
 }
 
-impl fmt::Debug for Response {
+impl<B: MessageBody> fmt::Debug for Response<B> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let res = writeln!(
             f,
             "\nResponse {:?} {}{}",
-            self.get_ref().version,
-            self.get_ref().status,
-            self.get_ref().reason.unwrap_or("")
+            self.get_ref().head.version,
+            self.get_ref().head.status,
+            self.get_ref().head.reason.unwrap_or(""),
         );
-        let _ = writeln!(f, "  encoding: {:?}", self.get_ref().encoding);
         let _ = writeln!(f, "  headers:");
-        for (key, val) in self.get_ref().headers.iter() {
+        for (key, val) in self.get_ref().head.headers.iter() {
             let _ = writeln!(f, "    {:?}: {:?}", key, val);
         }
+        let _ = writeln!(f, "  body: {:?}", self.1.length());
         res
     }
 }
@@ -335,7 +293,6 @@ impl<'a> Iterator for CookieIter<'a> {
 /// This type can be used to construct an instance of `Response` through a
 /// builder-like pattern.
 pub struct ResponseBuilder {
-    pool: &'static ResponsePool,
     response: Option<Box<InnerResponse>>,
     err: Option<HttpError>,
     cookies: Option<CookieJar>,
@@ -346,18 +303,7 @@ impl ResponseBuilder {
     #[inline]
     pub fn status(&mut self, status: StatusCode) -> &mut Self {
         if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.status = status;
-        }
-        self
-    }
-
-    /// Set HTTP version of this response.
-    ///
-    /// By default response's http version depends on request's version.
-    #[inline]
-    pub fn version(&mut self, version: Version) -> &mut Self {
-        if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.version = Some(version);
+            parts.head.status = status;
         }
         self
     }
@@ -382,7 +328,7 @@ impl ResponseBuilder {
         if let Some(parts) = parts(&mut self.response, &self.err) {
             match hdr.try_into() {
                 Ok(value) => {
-                    parts.headers.append(H::name(), value);
+                    parts.head.headers.append(H::name(), value);
                 }
                 Err(e) => self.err = Some(e.into()),
             }
@@ -390,7 +336,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set a header.
+    /// Append a header to existing headers.
     ///
     /// ```rust,ignore
     /// # extern crate actix_web;
@@ -413,7 +359,40 @@ impl ResponseBuilder {
             match HeaderName::try_from(key) {
                 Ok(key) => match value.try_into() {
                     Ok(value) => {
-                        parts.headers.append(key, value);
+                        parts.head.headers.append(key, value);
+                    }
+                    Err(e) => self.err = Some(e.into()),
+                },
+                Err(e) => self.err = Some(e.into()),
+            };
+        }
+        self
+    }
+
+    /// Set a header.
+    ///
+    /// ```rust,ignore
+    /// # extern crate actix_web;
+    /// use actix_web::{http, Request, Response};
+    ///
+    /// fn index(req: HttpRequest) -> Response {
+    ///     Response::Ok()
+    ///         .set_header("X-TEST", "value")
+    ///         .set_header(http::header::CONTENT_TYPE, "application/json")
+    ///         .finish()
+    /// }
+    /// fn main() {}
+    /// ```
+    pub fn set_header<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        HeaderName: HttpTryFrom<K>,
+        V: IntoHeaderValue,
+    {
+        if let Some(parts) = parts(&mut self.response, &self.err) {
+            match HeaderName::try_from(key) {
+                Ok(key) => match value.try_into() {
+                    Ok(value) => {
+                        parts.head.headers.insert(key, value);
                     }
                     Err(e) => self.err = Some(e.into()),
                 },
@@ -427,62 +406,37 @@ impl ResponseBuilder {
     #[inline]
     pub fn reason(&mut self, reason: &'static str) -> &mut Self {
         if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.reason = Some(reason);
+            parts.head.reason = Some(reason);
         }
         self
     }
 
-    /// Set content encoding.
-    ///
-    /// By default `ContentEncoding::Auto` is used, which automatically
-    /// negotiates content encoding based on request's `Accept-Encoding`
-    /// headers. To enforce specific encoding, use specific
-    /// ContentEncoding` value.
+    /// Set connection type to KeepAlive
     #[inline]
-    pub fn content_encoding(&mut self, enc: ContentEncoding) -> &mut Self {
+    pub fn keep_alive(&mut self) -> &mut Self {
         if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.encoding = Some(enc);
-        }
-        self
-    }
-
-    /// Set connection type
-    #[inline]
-    #[doc(hidden)]
-    pub fn connection_type(&mut self, conn: ConnectionType) -> &mut Self {
-        if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.connection_type = Some(conn);
+            parts.head.set_connection_type(ConnectionType::KeepAlive);
         }
         self
     }
 
     /// Set connection type to Upgrade
     #[inline]
-    #[doc(hidden)]
-    pub fn upgrade(&mut self) -> &mut Self {
-        self.connection_type(ConnectionType::Upgrade)
+    pub fn upgrade<V>(&mut self, value: V) -> &mut Self
+    where
+        V: IntoHeaderValue,
+    {
+        if let Some(parts) = parts(&mut self.response, &self.err) {
+            parts.head.set_connection_type(ConnectionType::Upgrade);
+        }
+        self.set_header(header::UPGRADE, value)
     }
 
     /// Force close connection, even if it is marked as keep-alive
     #[inline]
     pub fn force_close(&mut self) -> &mut Self {
-        self.connection_type(ConnectionType::Close)
-    }
-
-    /// Enables automatic chunked transfer encoding
-    #[inline]
-    pub fn chunked(&mut self) -> &mut Self {
         if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.chunked = Some(true);
-        }
-        self
-    }
-
-    /// Force disable chunked encoding
-    #[inline]
-    pub fn no_chunking(&mut self) -> &mut Self {
-        if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.chunked = Some(false);
+            parts.head.set_connection_type(ConnectionType::Close);
         }
         self
     }
@@ -496,7 +450,7 @@ impl ResponseBuilder {
         if let Some(parts) = parts(&mut self.response, &self.err) {
             match HeaderValue::try_from(value) {
                 Ok(value) => {
-                    parts.headers.insert(header::CONTENT_TYPE, value);
+                    parts.head.headers.insert(header::CONTENT_TYPE, value);
                 }
                 Err(e) => self.err = Some(e.into()),
             };
@@ -595,38 +549,48 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set write buffer capacity
-    ///
-    /// This parameter makes sense only for streaming response
-    /// or actor. If write buffer reaches specified capacity, stream or actor
-    /// get paused.
-    ///
-    /// Default write buffer capacity is 64kb
-    pub fn write_buffer_capacity(&mut self, cap: usize) -> &mut Self {
-        if let Some(parts) = parts(&mut self.response, &self.err) {
-            parts.write_capacity = cap;
-        }
-        self
-    }
+    // /// Set write buffer capacity
+    // ///
+    // /// This parameter makes sense only for streaming response
+    // /// or actor. If write buffer reaches specified capacity, stream or actor
+    // /// get paused.
+    // ///
+    // /// Default write buffer capacity is 64kb
+    // pub fn write_buffer_capacity(&mut self, cap: usize) -> &mut Self {
+    //     if let Some(parts) = parts(&mut self.response, &self.err) {
+    //         parts.write_capacity = cap;
+    //     }
+    //     self
+    // }
 
     /// Set a body and generate `Response`.
     ///
     /// `ResponseBuilder` can not be used after this call.
     pub fn body<B: Into<Body>>(&mut self, body: B) -> Response {
+        self.message_body(body.into())
+    }
+
+    /// Set a body and generate `Response`.
+    ///
+    /// `ResponseBuilder` can not be used after this call.
+    pub fn message_body<B: MessageBody>(&mut self, body: B) -> Response<B> {
         if let Some(e) = self.err.take() {
-            return Error::from(e).into();
+            return Response::from(Error::from(e)).into_body();
         }
+
         let mut response = self.response.take().expect("cannot reuse response builder");
         if let Some(ref jar) = self.cookies {
             for cookie in jar.delta() {
                 match HeaderValue::from_str(&cookie.to_string()) {
-                    Ok(val) => response.headers.append(header::SET_COOKIE, val),
-                    Err(e) => return Error::from(e).into(),
+                    Ok(val) => {
+                        let _ = response.head.headers.append(header::SET_COOKIE, val);
+                    }
+                    Err(e) => return Response::from(Error::from(e)).into_body(),
                 };
             }
         }
-        response.body = body.into();
-        Response(response, self.pool)
+
+        Response(response, ResponseBody::Body(body))
     }
 
     #[inline]
@@ -636,9 +600,9 @@ impl ResponseBuilder {
     pub fn streaming<S, E>(&mut self, stream: S) -> Response
     where
         S: Stream<Item = Bytes, Error = E> + 'static,
-        E: Into<Error>,
+        E: Into<Error> + 'static,
     {
-        self.body(Body::Streaming(Box::new(stream.map_err(|e| e.into()))))
+        self.body(Body::from_message(BodyStream::new(stream)))
     }
 
     /// Set a json body and generate `Response`
@@ -656,7 +620,7 @@ impl ResponseBuilder {
             Ok(body) => {
                 let contains = if let Some(parts) = parts(&mut self.response, &self.err)
                 {
-                    parts.headers.contains_key(header::CONTENT_TYPE)
+                    parts.head.headers.contains_key(header::CONTENT_TYPE)
                 } else {
                     true
                 };
@@ -664,7 +628,7 @@ impl ResponseBuilder {
                     self.header(header::CONTENT_TYPE, "application/json");
                 }
 
-                self.body(body)
+                self.body(Body::from(body))
             }
             Err(e) => Error::from(e).into(),
         }
@@ -681,7 +645,6 @@ impl ResponseBuilder {
     /// This method construct new `ResponseBuilder`
     pub fn take(&mut self) -> ResponseBuilder {
         ResponseBuilder {
-            pool: self.pool,
             response: self.response.take(),
             err: self.err.take(),
             cookies: self.cookies.take(),
@@ -743,7 +706,7 @@ impl From<String> for Response {
 
 impl<'a> From<&'a String> for Response {
     fn from(val: &'a String) -> Self {
-        Response::build(StatusCode::OK)
+        Response::Ok()
             .content_type("text/plain; charset=utf-8")
             .body(val)
     }
@@ -765,92 +728,49 @@ impl From<BytesMut> for Response {
     }
 }
 
-#[derive(Debug)]
 struct InnerResponse {
-    version: Option<Version>,
-    headers: HeaderMap,
-    status: StatusCode,
-    reason: Option<&'static str>,
-    body: Body,
-    chunked: Option<bool>,
-    encoding: Option<ContentEncoding>,
-    connection_type: Option<ConnectionType>,
-    write_capacity: usize,
+    head: ResponseHead,
     response_size: u64,
     error: Option<Error>,
+    pool: &'static ResponsePool,
 }
 
 pub(crate) struct ResponseParts {
-    version: Option<Version>,
-    headers: HeaderMap,
-    status: StatusCode,
-    reason: Option<&'static str>,
-    body: Option<Bytes>,
-    encoding: Option<ContentEncoding>,
-    connection_type: Option<ConnectionType>,
+    head: ResponseHead,
     error: Option<Error>,
 }
 
 impl InnerResponse {
     #[inline]
-    fn new(status: StatusCode, body: Body) -> InnerResponse {
+    fn new(status: StatusCode, pool: &'static ResponsePool) -> InnerResponse {
         InnerResponse {
-            status,
-            body,
-            version: None,
-            headers: HeaderMap::with_capacity(16),
-            reason: None,
-            chunked: None,
-            encoding: None,
-            connection_type: None,
+            head: ResponseHead {
+                status,
+                version: Version::default(),
+                headers: HeaderMap::with_capacity(16),
+                reason: None,
+                ctype: None,
+            },
+            pool,
             response_size: 0,
-            write_capacity: MAX_WRITE_BUFFER_SIZE,
             error: None,
         }
     }
 
     /// This is for failure, we can not have Send + Sync on Streaming and Actor response
-    fn into_parts(mut self) -> ResponseParts {
-        let body = match mem::replace(&mut self.body, Body::Empty) {
-            Body::Empty => None,
-            Body::Binary(mut bin) => Some(bin.take()),
-            Body::Streaming(_) => {
-                error!("Streaming or Actor body is not support by error response");
-                None
-            }
-        };
-
+    fn into_parts(self) -> ResponseParts {
         ResponseParts {
-            body,
-            version: self.version,
-            headers: self.headers,
-            status: self.status,
-            reason: self.reason,
-            encoding: self.encoding,
-            connection_type: self.connection_type,
+            head: self.head,
             error: self.error,
         }
     }
 
     fn from_parts(parts: ResponseParts) -> InnerResponse {
-        let body = if let Some(ref body) = parts.body {
-            Body::Binary(body.clone().into())
-        } else {
-            Body::Empty
-        };
-
         InnerResponse {
-            body,
-            status: parts.status,
-            version: parts.version,
-            headers: parts.headers,
-            reason: parts.reason,
-            chunked: None,
-            encoding: parts.encoding,
-            connection_type: parts.connection_type,
+            head: parts.head,
             response_size: 0,
-            write_capacity: MAX_WRITE_BUFFER_SIZE,
             error: parts.error,
+            pool: ResponsePool::pool(),
         }
     }
 }
@@ -876,17 +796,15 @@ impl ResponsePool {
         status: StatusCode,
     ) -> ResponseBuilder {
         if let Some(mut msg) = pool.0.borrow_mut().pop_front() {
-            msg.status = status;
+            msg.head.status = status;
             ResponseBuilder {
-                pool,
                 response: Some(msg),
                 err: None,
                 cookies: None,
             }
         } else {
-            let msg = Box::new(InnerResponse::new(status, Body::Empty));
+            let msg = Box::new(InnerResponse::new(status, pool));
             ResponseBuilder {
-                pool,
                 response: Some(msg),
                 err: None,
                 cookies: None,
@@ -895,18 +813,19 @@ impl ResponsePool {
     }
 
     #[inline]
-    pub fn get_response(
+    pub fn get_response<B: MessageBody>(
         pool: &'static ResponsePool,
         status: StatusCode,
-        body: Body,
-    ) -> Response {
+        body: B,
+    ) -> Response<B> {
         if let Some(mut msg) = pool.0.borrow_mut().pop_front() {
-            msg.status = status;
-            msg.body = body;
-            Response(msg, pool)
+            msg.head.status = status;
+            Response(msg, ResponseBody::Body(body))
         } else {
-            let msg = Box::new(InnerResponse::new(status, body));
-            Response(msg, pool)
+            Response(
+                Box::new(InnerResponse::new(status, pool)),
+                ResponseBody::Body(body),
+            )
         }
     }
 
@@ -916,23 +835,17 @@ impl ResponsePool {
     }
 
     #[inline]
-    fn with_body(status: StatusCode, body: Body) -> Response {
+    fn with_body<B: MessageBody>(status: StatusCode, body: B) -> Response<B> {
         POOL.with(|pool| ResponsePool::get_response(pool, status, body))
     }
 
     #[inline]
-    fn release(&self, mut inner: Box<InnerResponse>) {
-        let mut p = self.0.borrow_mut();
+    fn release(mut inner: Box<InnerResponse>) {
+        let mut p = inner.pool.0.borrow_mut();
         if p.len() < 128 {
-            inner.headers.clear();
-            inner.version = None;
-            inner.chunked = None;
-            inner.reason = None;
-            inner.encoding = None;
-            inner.connection_type = None;
+            inner.head.clear();
             inner.response_size = 0;
             inner.error = None;
-            inner.write_capacity = MAX_WRITE_BUFFER_SIZE;
             p.push_front(inner);
         }
     }
@@ -941,11 +854,10 @@ impl ResponsePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use body::Binary;
+    use body::Body;
     use http;
     use http::header::{HeaderValue, CONTENT_TYPE, COOKIE};
 
-    use header::ContentEncoding;
     // use test::TestRequest;
 
     #[test]
@@ -1016,24 +928,26 @@ mod tests {
 
     #[test]
     fn test_basic_builder() {
-        let resp = Response::Ok()
-            .header("X-TEST", "value")
-            .version(Version::HTTP_10)
-            .finish();
-        assert_eq!(resp.version(), Some(Version::HTTP_10));
+        let resp = Response::Ok().header("X-TEST", "value").finish();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
     fn test_upgrade() {
-        let resp = Response::build(StatusCode::OK).upgrade().finish();
-        assert!(resp.upgrade())
+        let resp = Response::build(StatusCode::OK)
+            .upgrade("websocket")
+            .finish();
+        assert!(resp.upgrade());
+        assert_eq!(
+            resp.headers().get(header::UPGRADE).unwrap(),
+            HeaderValue::from_static("websocket")
+        );
     }
 
     #[test]
     fn test_force_close() {
         let resp = Response::build(StatusCode::OK).force_close().finish();
-        assert!(!resp.keep_alive().unwrap())
+        assert!(!resp.keep_alive())
     }
 
     #[test]
@@ -1044,34 +958,31 @@ mod tests {
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "text/plain")
     }
 
-    #[test]
-    fn test_content_encoding() {
-        let resp = Response::build(StatusCode::OK).finish();
-        assert_eq!(resp.content_encoding(), None);
+    // #[test]
+    // fn test_content_encoding() {
+    //     let resp = Response::build(StatusCode::OK).finish();
+    //     assert_eq!(resp.content_encoding(), None);
 
-        #[cfg(feature = "brotli")]
-        {
-            let resp = Response::build(StatusCode::OK)
-                .content_encoding(ContentEncoding::Br)
-                .finish();
-            assert_eq!(resp.content_encoding(), Some(ContentEncoding::Br));
-        }
+    //     #[cfg(feature = "brotli")]
+    //     {
+    //         let resp = Response::build(StatusCode::OK)
+    //             .content_encoding(ContentEncoding::Br)
+    //             .finish();
+    //         assert_eq!(resp.content_encoding(), Some(ContentEncoding::Br));
+    //     }
 
-        let resp = Response::build(StatusCode::OK)
-            .content_encoding(ContentEncoding::Gzip)
-            .finish();
-        assert_eq!(resp.content_encoding(), Some(ContentEncoding::Gzip));
-    }
+    //     let resp = Response::build(StatusCode::OK)
+    //         .content_encoding(ContentEncoding::Gzip)
+    //         .finish();
+    //     assert_eq!(resp.content_encoding(), Some(ContentEncoding::Gzip));
+    // }
 
     #[test]
     fn test_json() {
         let resp = Response::build(StatusCode::OK).json(vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
         assert_eq!(ct, HeaderValue::from_static("application/json"));
-        assert_eq!(
-            *resp.body(),
-            Body::from(Bytes::from_static(b"[\"v1\",\"v2\",\"v3\"]"))
-        );
+        assert_eq!(resp.body().get_ref(), b"[\"v1\",\"v2\",\"v3\"]");
     }
 
     #[test]
@@ -1081,10 +992,7 @@ mod tests {
             .json(vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
         assert_eq!(ct, HeaderValue::from_static("text/json"));
-        assert_eq!(
-            *resp.body(),
-            Body::from(Bytes::from_static(b"[\"v1\",\"v2\",\"v3\"]"))
-        );
+        assert_eq!(resp.body().get_ref(), b"[\"v1\",\"v2\",\"v3\"]");
     }
 
     #[test]
@@ -1092,10 +1000,7 @@ mod tests {
         let resp = Response::build(StatusCode::OK).json2(&vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
         assert_eq!(ct, HeaderValue::from_static("application/json"));
-        assert_eq!(
-            *resp.body(),
-            Body::from(Bytes::from_static(b"[\"v1\",\"v2\",\"v3\"]"))
-        );
+        assert_eq!(resp.body().get_ref(), b"[\"v1\",\"v2\",\"v3\"]");
     }
 
     #[test]
@@ -1105,19 +1010,7 @@ mod tests {
             .json2(&vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
         assert_eq!(ct, HeaderValue::from_static("text/json"));
-        assert_eq!(
-            *resp.body(),
-            Body::from(Bytes::from_static(b"[\"v1\",\"v2\",\"v3\"]"))
-        );
-    }
-
-    impl Body {
-        pub(crate) fn bin_ref(&self) -> &Binary {
-            match *self {
-                Body::Binary(ref bin) => bin,
-                _ => panic!(),
-            }
-        }
+        assert_eq!(resp.body().get_ref(), b"[\"v1\",\"v2\",\"v3\"]");
     }
 
     #[test]
@@ -1129,7 +1022,7 @@ mod tests {
             HeaderValue::from_static("text/plain; charset=utf-8")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from("test"));
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let resp: Response = b"test".as_ref().into();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1138,7 +1031,7 @@ mod tests {
             HeaderValue::from_static("application/octet-stream")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from(b"test".as_ref()));
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let resp: Response = "test".to_owned().into();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1147,7 +1040,7 @@ mod tests {
             HeaderValue::from_static("text/plain; charset=utf-8")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from("test".to_owned()));
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let resp: Response = (&"test".to_owned()).into();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1156,7 +1049,7 @@ mod tests {
             HeaderValue::from_static("text/plain; charset=utf-8")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from(&"test".to_owned()));
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let b = Bytes::from_static(b"test");
         let resp: Response = b.into();
@@ -1166,10 +1059,7 @@ mod tests {
             HeaderValue::from_static("application/octet-stream")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.body().bin_ref(),
-            &Binary::from(Bytes::from_static(b"test"))
-        );
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let b = Bytes::from_static(b"test");
         let resp: Response = b.into();
@@ -1179,7 +1069,7 @@ mod tests {
             HeaderValue::from_static("application/octet-stream")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from(BytesMut::from("test")));
+        assert_eq!(resp.body().get_ref(), b"test");
 
         let b = BytesMut::from("test");
         let resp: Response = b.into();
@@ -1189,7 +1079,7 @@ mod tests {
             HeaderValue::from_static("application/octet-stream")
         );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().bin_ref(), &Binary::from(BytesMut::from("test")));
+        assert_eq!(resp.body().get_ref(), b"test");
     }
 
     #[test]

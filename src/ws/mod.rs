@@ -8,7 +8,7 @@ use std::io;
 use error::ResponseError;
 use http::{header, Method, StatusCode};
 use request::Request;
-use response::{ConnectionType, Response, ResponseBuilder};
+use response::{Response, ResponseBuilder};
 
 mod client;
 mod codec;
@@ -183,8 +183,7 @@ pub fn handshake_response(req: &Request) -> ResponseBuilder {
     };
 
     Response::build(StatusCode::SWITCHING_PROTOCOLS)
-        .connection_type(ConnectionType::Upgrade)
-        .header(header::UPGRADE, "websocket")
+        .upgrade("websocket")
         .header(header::TRANSFER_ENCODING, "chunked")
         .header(header::SEC_WEBSOCKET_ACCEPT, key.as_str())
         .take()
