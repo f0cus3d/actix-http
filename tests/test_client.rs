@@ -99,3 +99,37 @@ fn test_with_query_parameter() {
     let response = srv.block_on(request.send(&mut connector)).unwrap();
     assert!(response.status().is_success());
 }
+
+#[test]
+fn client_basic_auth() {
+    let mut srv = TestServer::new(move || {
+        h1::H1Service::build()
+            .finish(|_| future::ok::<_, ()>(Response::Ok().body(STR)))
+            .map(|_| ())
+    });
+    /// set authorization header to Basic <base64 encoded username:password>
+    let request = srv
+                    .get()
+                    .basic_auth("username", Some("password"))
+                    .finish()
+                    .unwrap();
+    let repr = format!("{:?}", request);
+    assert!(repr.contains("Basic dXNlcm5hbWU6cGFzc3dvcmQ="));
+}
+
+#[test]
+fn client_bearer_auth() {
+    let mut srv = TestServer::new(move || {
+        h1::H1Service::build()
+            .finish(|_| future::ok::<_, ()>(Response::Ok().body(STR)))
+            .map(|_| ())
+    });
+    /// set authorization header to Bearer <token>
+    let request = srv
+                    .get()
+                    .bearer_auth("someS3cr3tAutht0k3n")
+                    .finish()
+                    .unwrap();
+    let repr = format!("{:?}", request);
+    assert!(repr.contains("Bearer someS3cr3tAutht0k3n"));
+}
